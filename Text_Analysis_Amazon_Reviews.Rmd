@@ -1,0 +1,3003 @@
+---
+title: "Text Analysis on Amazon Reviews"
+output: pdf_document
+---
+
+# Setup
+``` {r, include = FALSE}
+knitr::opts_chunk$set(eval = FALSE)
+```
+
+```{r setup,eval = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidytext)
+library(stringr)
+library(cld2)
+library(cld3)
+library(textclean)
+library(tm)
+library(readr)
+library(jsonlite)
+library(dplyr)
+library(tibble)
+library(tidyverse)
+library(wordcloud)
+library(wordcloud2)
+library(emmeans)
+library(ggplot2)
+library(janeaustenr)
+library(ggpubr)
+library(factoextra)
+library(widyr)
+library(ggraph)
+library(influential)
+library(magrittr) 
+library(ROSE)
+library(caTools)
+library(caret)
+library(MASS)
+library(qdap)
+library(hunspell)
+library(xlsx)
+library(stringi)
+library(splitstackshape)  
+library(stargazer)
+library(FSelector)
+library(corrplot)
+library(sentimentr)
+library(pscl)
+library(topicmodels)
+library(stm)
+library(textcat)
+library(udpipe)
+library(tidyr)
+```
+
+# Data Preparation
+
+```{r Data Ingestion}
+#Data is downloaded from - https://jmcauley.ucsd.edu/data/amazon/
+
+h_and_k_data <- stream_in(file("Home_and_Kitchen_5.json")) 
+h_and_k_metadata <- read_csv("meta_Home_and_Kitchen.csv")
+
+#Checking the contents of the home and kitchen data and metadata
+str(h_and_k_data)
+#Converting reviewTime column to date datatype
+h_and_k_data[['reviewTime']] <- as.Date(h_and_k_data[['reviewTime']], "%m %d, %Y")
+
+str(h_and_k_metadata)
+#Converting categories column to a factor 
+h_and_k_metadata$categories <- as.factor(h_and_k_metadata$categories)
+
+```
+
+## Home and Kitchen Data Preprocessing
+
+``` {r Home and Kitchen Data Preprocessing, eval = FALSE}
+#Plotting frequent terms before text cleaning
+plot_beforecleaning <- plot(freq_terms(h_and_k_data$reviewText))
+
+#Deteting language in reviews to filter out English reviews
+#Checking to see which language detection is better
+h_and_k_data$cld2_lang <- cld2::detect_language(h_and_k_data$reviewText)
+h_and_k_data$cld3_lang <- cld3::detect_language(h_and_k_data$reviewText)
+diff_lang_rows <- which(h_and_k_data$cld2_lang != h_and_k_data$cld3_lang)
+
+#Filtering out the asin IDs to manually check whether cld2 or cld3 is more accurate
+#Filtering out asing IDs where cld2 identified English but cld3 didn't 
+which(h_and_k_data[diff_lang_rows,'cld2_lang'] == 'en') %>% diff_lang_rows[.] %>% h_and_k_data[.,1]
+
+#It appears cld2 more accurately identifies English than cld3, however let's check the cases where cld2 has identified another language
+which(h_and_k_data[diff_lang_rows,'cld2_lang'] != 'en') %>% diff_lang_rows[.] %>% h_and_k_data[.,1]
+#Manually changing to accurate language since it's just once record
+h_and_k_data[260425,'cld2_lang'] = "en"
+#Upon reviewing the results of cld2 and cld3, cld2 appears to be more accurately identifying language in reviews
+
+table(h_and_k_data$cld2_lang !='en')
+#71 records have been identified as not English
+sum(is.na(h_and_k_data$cld2_lang))
+#591 records are given NA as a value for language idenitifed
+#Since number of records in both cases are very low compared to the size of the dataset, ignoring these records will not affect our analysis
+
+#Filtering out only English records and relevant columns
+h_and_k_data %>% filter (h_and_k_data$cld2_lang == 'en') %>% select(reviewerID,asin,reviewerName,helpful,reviewText,overall) -> h_and_k_data_onlyE
+
+#Trimming trailing, leading and whitespaces in between in text
+h_and_k_data_onlyE$reviewText <- str_squish(h_and_k_data_onlyE$reviewText)
+
+#Removing URLs from data
+#Regex to remove urls starting with http
+h_and_k_data_onlyE$reviewText <- gsub("http\\S+\\s*", "", h_and_k_data_onlyE$reviewText)
+#Regex to remove urls starting with www
+h_and_k_data_onlyE$reviewText <- gsub("www.\\S+\\.\\S+\\s*", "", h_and_k_data_onlyE$reviewText)
+#Checking if any other URLs are to be removed
+urls_in_data <- ex_url(h_and_k_data_onlyE$reviewText) [is.na(ex_url(h_and_k_data_onlyE$reviewText))==F]
+#Extract indexes for where URLs have to be replaced
+which(is.na(ex_url(h_and_k_data_onlyE$reviewText))==F) 
+#Upon reviewing these few instances, these aren't URLs and can be left as is
+
+#Removing  numbers from data as they add no significant meaning for text analysis (reviewed with multiple iterations)
+h_and_k_data_onlyE$reviewText <- gsub('[[:digit:]]+', '', h_and_k_data_onlyE$reviewText)
+
+#Converting text to lowercase
+h_and_k_data_onlyE$reviewText <- tolower(h_and_k_data_onlyE$reviewText)
+
+#Removing text between brackets
+h_and_k_data_onlyE$reviewText <- bracketX(h_and_k_data_onlyE$reviewText)
+
+#Replacing contractions 
+h_and_k_data_onlyE$reviewText <- replace_contraction(h_and_k_data_onlyE$reviewText)
+
+#Replacing symbols
+h_and_k_data_onlyE$reviewText <- replace_symbol(h_and_k_data_onlyE$reviewText)
+
+#Replacing word elongations
+h_and_k_data_onlyE$reviewText <- replace_word_elongation(h_and_k_data_onlyE$reviewText, impart.meaning = FALSE)
+
+#Replacing abbreviations
+#Common abbreviations in reviews
+abv <- c("pls", "rofl", "bogo", "fwiw", "asap", "b/c")
+repl <- c("please","rolling on the floor laughing","buy one get one", "for what it is worth", "as soon as possible", "because")
+h_and_k_data_onlyE$reviewText<- replace_abbreviation(h_and_k_data_onlyE$reviewText, abv, repl)
+
+#Removing punctuation
+h_and_k_data_onlyE$reviewText <- gsub('[[:punct:]]+',' ',h_and_k_data_onlyE$reviewText)
+
+#Removing non ascii characters
+h_and_k_data_onlyE$reviewText <- replace_non_ascii(h_and_k_data_onlyE$reviewText)
+
+#Trimming trailing, leading and whitespaces in between in text
+h_and_k_data_onlyE$reviewText <- str_squish(h_and_k_data_onlyE$reviewText)
+
+#Plotting the length of reviewtext in the data
+plot1 <- h_and_k_data_onlyE %>%
+mutate(length = nchar(reviewText)) %>%
+ggplot(.,aes(length))+geom_histogram(bindwidth = 1)+xlim(20,5500)
+
+plot2 <- h_and_k_data_onlyE %>% mutate(rev_length = nchar(reviewText)) %>% group_by(rev_length) %>% summarise(count = n()) %>%   ggplot(.,aes(x=rev_length,y=count))+geom_point()+geom_line()+geom_smooth()+xlim(0,10000)+labs(x = "Review Length", y = "Count", title = "Distribution of Review Length")
+#As can be seen with the plot, majority of the reviews have a length between 100 characters and 1500 charactes, thus filtering out reviews that don't fall within this range (this is in accordance to amazon guidelines)
+h_and_k_data_onlyE %>% filter(nchar(reviewText) >= 100 & nchar(reviewText) <= 1500) -> h_and_k_data_onlyE
+
+```
+
+##Home and Kitchen Metadata Preprocessing
+
+``` {r Home and Kitchen Metadata Preprocessing, eval = FALSE}
+#Merging the metadata with the cleaned data, so as to only preprocess records that are there in the merged dataframe
+h_and_k_data_onlyE <- h_and_k_data_onlyE %>% left_join(h_and_k_metadata, by = "asin")
+
+#Using cld2 to detect language, since it has already been identified to be more accurate previously
+h_and_k_data_onlyE$cld2_lang_title <- cld2::detect_language(h_and_k_data_onlyE$title)
+h_and_k_data_onlyE$cld2_lang_desc <- cld2::detect_language(h_and_k_data_onlyE$description)
+#Identifying rows where language identified for title and description is different
+diff_lang_rows <- which(h_and_k_data_onlyE$cld2_lang_title != h_and_k_data_onlyE$cld2_lang_desc)
+
+#Amongst such rows above, if the language identified for the description is English, then changing the language identified for title to English as well since length of description text is generally larger than length of title
+incorrect_title_lang <- which(h_and_k_data_onlyE$cld2_lang_desc[diff_lang_rows] == 'en') %>% diff_lang_rows[.] 
+h_and_k_data_onlyE[incorrect_title_lang,'cld2_lang_title'] = 'en'
+
+#Filtering for records that have been identified as having English description and title, this is to ensure every review has a corresponding description and title
+h_and_k_data_onlyE <- filter (h_and_k_data_onlyE, cld2_lang_desc == 'en' & cld2_lang_title == 'en')
+
+#Removing urls from title and description
+h_and_k_data_onlyE$title <- gsub("http\\S+\\s*", "", h_and_k_data_onlyE$title)
+h_and_k_data_onlyE$description <- gsub("http\\S+\\s*", "", h_and_k_data_onlyE$description)
+h_and_k_data_onlyE$title <- gsub("www.\\S+\\.\\S+\\s*", "", h_and_k_data_onlyE$title)
+h_and_k_data_onlyE$description <- gsub("www.\\S+\\.\\S+\\s*", "", h_and_k_data_onlyE$description)
+
+urls_in_metadata <- ex_url(h_and_k_data_onlyE$title) [is.na(ex_url(h_and_k_data_onlyE$title))==F]
+#None were found 
+
+urls_in_metadata <- ex_url(h_and_k_data_onlyE$description) [is.na(ex_url(h_and_k_data_onlyE$description))==F]
+#No urls were found 
+
+#Removing  numbers from data as they add no significant meaning for text analysis (reviewed with multiple iterations)
+h_and_k_data_onlyE$title <- gsub('[[:digit:]]+', '', h_and_k_data_onlyE$title)
+h_and_k_data_onlyE$description <- gsub('[[:digit:]]+', '', h_and_k_data_onlyE$description)
+
+#Converting text to lowercase
+h_and_k_data_onlyE$title <- tolower(h_and_k_data_onlyE$title)
+h_and_k_data_onlyE$description <- tolower(h_and_k_data_onlyE$description)
+
+#Removing text between brackets
+h_and_k_data_onlyE$title <- bracketX(h_and_k_data_onlyE$title)
+h_and_k_data_onlyE$description <- bracketX(h_and_k_data_onlyE$description)
+
+#Replacing contractions 
+h_and_k_data_onlyE$title <- replace_contraction(h_and_k_data_onlyE$title)
+h_and_k_data_onlyE$description <- replace_contraction(h_and_k_data_onlyE$description)
+
+#Replacing symbols
+h_and_k_data_onlyE$title <- replace_symbol(h_and_k_data_onlyE$title)
+h_and_k_data_onlyE$description <- replace_symbol(h_and_k_data_onlyE$description)
+
+#Replacing word elongations
+h_and_k_data_onlyE$title <- replace_word_elongation(h_and_k_data_onlyE$title, impart.meaning = FALSE)
+h_and_k_data_onlyE$description <- replace_word_elongation(h_and_k_data_onlyE$description, impart.meaning = FALSE)
+
+#Removing punctuation
+h_and_k_data_onlyE$title <- gsub('[[:punct:]]+',' ',h_and_k_data_onlyE$title)
+h_and_k_data_onlyE$description <- gsub('[[:punct:]]+',' ',h_and_k_data_onlyE$description)
+
+#Removing non ascii characters
+h_and_k_data_onlyE$title <- replace_non_ascii(h_and_k_data_onlyE$title)
+h_and_k_data_onlyE$description <- replace_non_ascii(h_and_k_data_onlyE$description)
+
+#Trimming trailing, leading and whitespaces in between in text
+h_and_k_data_onlyE$title <- str_squish(h_and_k_data_onlyE$title)
+h_and_k_data_onlyE$description <- str_squish(h_and_k_data_onlyE$description)
+
+#Plotting the length of title in the data
+plot1 <- h_and_k_data_onlyE %>%
+mutate(length = nchar(title)) %>%
+ggplot(.,aes(length))+geom_histogram(bindwidth = 1)
+print(plot1)
+
+plot2 <- h_and_k_data_onlyE %>% mutate(title_length = nchar(title)) %>% group_by(title_length) %>% summarise(count = n()) %>%   ggplot(.,aes(x=title_length,y=count))+geom_point()+geom_line()+geom_smooth()
+#As can be seen with the plot, majority of the titles have a length between 10 characters and 200 charactes, thus filtering out titles that don't fall within this range (this is in accordance to amazon guidelines)
+h_and_k_data_onlyE %>% filter(nchar(title) >= 10 & nchar(title) <= 200) -> h_and_k_data_onlyE
+
+#Plotting the length of description in the data
+plot1 <- h_and_k_data_onlyE %>%
+mutate(length = nchar(description)) %>%
+ggplot(.,aes(length))+geom_histogram(bindwidth = 1)
+
+plot2 <- h_and_k_data_onlyE %>% mutate(desc_length = nchar(description)) %>% group_by(desc_length) %>% summarise(count = n()) %>%   ggplot(.,aes(x=desc_length,y=count))+geom_point()+geom_line()+geom_smooth()
+#As can be seen with the plot, majority of the titles have a length between 30 characters and 2500 charactes, thus filtering out titles that don't fall within this range (this is in accordance to amazon guidelines)
+h_and_k_data_onlyE %>% filter(nchar(description) >= 30 & nchar(description) <= 2500) -> h_and_k_data_onlyE
+
+```
+
+## Tokenization & Custom & Regular Stopwords Removal
+
+``` {r Tokenizing data and custom stopwords removal, eval = FALSE}
+#Tokenizing review text column
+text_df <- tibble(line = 1:nrow(h_and_k_data_onlyE), text = h_and_k_data_onlyE$reviewText)
+tokenized_df <- text_df %>% unnest_tokens(word,text)
+
+#Identifying stopwords in reviewtext
+#data("stop_words")
+tokenized_df <- anti_join(tokenized_df,stop_words)
+tokenized_df %>% group_by(word) %>% 
+summarise(count = n(), prop = count/nrow(tokenized_df)) %>%
+arrange(desc(prop)) %>%
+top_n(20) %>%
+ggplot(.,aes(x=reorder(word,prop),y=prop))+geom_point(stat="identity")+coord_flip()
+#Adding custom stopwords to stopwords list
+custom_stopwords = data.frame(word=c("easy","nice","perfect","bought","buy", "time", "recommend"),lexicon=rep("custom",7))
+all_stopwords <- rbind(custom_stopwords,stop_words)
+#Removing stopwords from reviewtext
+h_and_k_data_onlyE$reviewText <- removeWords(h_and_k_data_onlyE$reviewText, c(all_stopwords$word))
+h_and_k_data_onlyE$reviewText <- str_squish(h_and_k_data_onlyE$reviewText)
+
+#Tokenizing review title column
+text_df <- tibble(line = 1:nrow(h_and_k_data_onlyE), text = h_and_k_data_onlyE$title)
+tokenized_df <- text_df %>% unnest_tokens(word,text)
+
+#Loading and identifying custom stopwords
+tokenized_df <- anti_join(tokenized_df,stop_words)
+tokenized_df %>% group_by(word) %>% 
+summarise(count = n(), prop = count/nrow(tokenized_df)) %>%
+arrange(desc(prop)) %>%
+top_n(20) %>%
+ggplot(.,aes(x=reorder(word,prop),y=prop))+geom_point(stat="identity")+coord_flip()
+
+#Adding custom stopwords to stopwords list
+custom_stopwords = data.frame(word=c("quart", "quot"),lexicon=rep("custom",2))
+all_stopwords <- rbind(custom_stopwords,stop_words)
+#Removing stopwords from title
+h_and_k_data_onlyE$title <- removeWords(h_and_k_data_onlyE$title, c(all_stopwords$word))
+h_and_k_data_onlyE$title <- str_squish(h_and_k_data_onlyE$title)
+
+#Tokenizing review desription column
+text_df <- tibble(line = 1:nrow(h_and_k_data_onlyE), text = h_and_k_data_onlyE$description)
+tokenized_df <- text_df %>% unnest_tokens(word,text)
+
+#Loading and identifying custom stopwords
+tokenized_df <- anti_join(tokenized_df,stop_words)
+tokenized_df %>% group_by(word) %>% 
+summarise(count = n(), prop = count/nrow(tokenized_df)) %>%
+arrange(desc(prop)) %>%
+top_n(20) %>%
+ggplot(.,aes(x=reorder(word,prop),y=prop))+geom_point(stat="identity")+coord_flip()
+#Adding custom stopwords to stopwords list
+custom_stopwords = data.frame(word=c("easy", "perfect"),lexicon=rep("custom",2))
+all_stopwords <- rbind(custom_stopwords,stop_words)
+#Removing stopwords from description
+h_and_k_data_onlyE$description <- removeWords(h_and_k_data_onlyE$description, c(all_stopwords$word))
+h_and_k_data_onlyE$description <- str_squish(h_and_k_data_onlyE$description)
+
+#df <- h_and_k_data_onlyE
+#df <- apply(df,2,as.character)
+#write.csv(df,"Cleaned_H&K_Data_updated.csv", row.names = FALSE)
+
+```
+
+# Part A - Construction of Corpus 
+## Part A - Question A
+
+```{r, eval = FALSE}
+#AmazonRevs <- stream_in(gzfile("reviews_Home_and_kitchen_5.json.gz"))
+cleandata <- read_csv("Cleaned_H&K_Data_updated.csv")
+```
+
+```{r, eval = FALSE}
+#summary(AmazonRevs)
+#count(AmazonRevs)
+```
+
+```{r, eval = FALSE}
+summary(cleandata)
+```
+
+```{r, eval = FALSE}
+#tokenizing the reviewtext column, this separated the sentances into individual words
+tidy_review <- cleandata %>%
+  unnest_tokens(word, reviewText) 
+
+tidy_review
+```
+
+```{r, eval = FALSE}
+#removing stopwords from reviewtext column
+#creating a custom list of words and combining it with the stop word list then removing it from the tokenized columns 
+
+newwords = data.frame(word=c("hrf","jah","ap","pfte", "kh", "urn", "tsk", "trbc", "tr", "llc", "khmdh", "orek", "traex", "kf","pcmi", "ahe", "mira", "tros", "ribitt", "edv", "bjx", "uh", "dcf","sheex", "koyal", "fante", "ecm", "hoot", "xcf", "tom", "el", "urm", "ofc", "ccj", "scvp", "sco", "srb", "jlss", "hl", "nv"),lexicon=rep("custom",40))
+allstopwords = rbind(newwords,stop_words)
+tidy_review=tidy_review %>% anti_join(allstopwords)
+
+#tidy_review <- tidy_review %>% 
+  #anti_join(allstopwords)
+
+```
+
+```{r, eval = FALSE}
+#tokenizing the item description column
+tidy_description <- cleandata %>%
+  unnest_tokens(word, description) 
+
+
+#removing stop words the description column
+
+tidy_description <- tidy_description %>% 
+  anti_join(allstopwords)
+```
+
+```{r, eval = FALSE}
+#focusing on the words and overall column. 
+rev_words <- tidy_review %>%
+  count(overall, word, sort = TRUE)
+```
+
+```{r, eval = FALSE}
+#gives table of total words in each review category for both reviews
+total_review_words <- rev_words %>% 
+  group_by(overall) %>% 
+  summarize(total = sum(n))
+
+```
+
+```{r, eval = FALSE}
+#join the review token words with the total review words
+rev_words <- rev_words %>% 
+  left_join(total_review_words)
+
+```
+
+```{r, eval = FALSE}
+#then we plot the number of words over the total using a histogram
+rev_words %>% 
+  mutate(tf = n/total) %>% 
+  ggplot(aes(x=tf,fill=overall))+
+  geom_histogram(show.legend = FALSE)+
+  xlim(0,0.0009)+
+  ylim(0,1100)+
+  facet_wrap(overall~.,ncol=2,scales = "free_y")
+```
+
+```{r, eval = FALSE}
+#getting Zipf's Law & getting the frequwncy ranks of the words in the reviews.
+rev_words %>% 
+  group_by(overall) %>% 
+  mutate(rank = row_number(), 
+         tf = n/total) %>% 
+  ungroup() -> zipf_data_rev
+```
+
+```{r, eval = FALSE}
+#plotting Zipf for review words
+zipf_data_rev %>% 
+  ggplot(aes(rank, tf, color = overall)) + 
+  geom_line(size = 1.1, alpha = 0.8, show.legend = TRUE) + 
+  scale_x_log10() +
+  scale_y_log10() + 
+  coord_equal()
+```
+
+```{r, eval = FALSE}
+#calculating the TF-IDF for review words
+ rev_tf_idf <- rev_words %>% 
+      bind_tf_idf(word,overall,n) %>% 
+  dplyr::select(-total) 
+```
+
+```{r, eval = FALSE}
+#Plotting
+rev_tf_idf %>%
+  group_by(overall) %>%
+  slice_max(tf_idf, n = 10) %>%
+  ungroup() %>%
+  ggplot(aes(tf_idf, reorder(word, tf_idf), fill = overall)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~overall, ncol = 2, scales = "free") +
+  labs(x = "tf-idf", y = NULL, title = "Most dominant review words per star rating")
+```
+
+
+```{r, eval = FALSE}
+#repeat the same process for the words in the description.
+#gives word count for each review rating for description words
+description_words <- tidy_description %>%
+  count(overall, word, sort = TRUE)
+```
+
+
+```{r, eval = FALSE}
+#gives table of total words in each review category for both description
+total_description_words <- description_words %>% 
+  group_by(overall) %>% 
+  summarize(total = sum(n))
+
+```
+
+```{r, eval = FALSE}
+#join the two tables
+description_words <- description_words %>% 
+  left_join(total_description_words)
+```
+
+```{r, eval = FALSE}
+#plot word frequency.
+description_words %>% 
+  mutate(tf = n/total) %>% 
+  ggplot(aes(x=tf,fill=overall))+
+  geom_histogram(show.legend = FALSE)+
+  xlim(0,0.0009)+
+  ylim(0,1100) +
+  facet_wrap(overall~.,ncol=2,scales = "free_y")
+```
+
+```{r, eval = FALSE}
+#Zipf's Law and frequency ranks on the description words
+description_words %>% 
+  group_by(overall) %>% 
+  mutate(rank = row_number(), 
+         tf = n/total) %>% 
+  ungroup() -> zipf_data_des
+```
+
+```{r, eval = FALSE}
+#plotting
+zipf_data_des %>% 
+  ggplot(aes(rank, tf, color = overall)) + 
+  geom_line(size = 1.1, alpha = 0.8, show.legend = TRUE) + 
+  scale_x_log10() +
+  scale_y_log10() + 
+  coord_equal()
+```
+
+```{r, eval = FALSE}
+#calculating TF-IDF
+ des_tf_idf <- description_words %>% 
+      bind_tf_idf(word,overall,n) %>% 
+      dplyr::select(-total) 
+```
+
+```{r, eval = FALSE}
+#plotting
+des_tf_idf %>%
+  group_by(overall) %>%
+  slice_max(tf_idf, n = 10) %>%
+  ungroup() %>%
+  ggplot(aes(tf_idf, reorder(word, tf_idf), fill = overall)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~overall, ncol = 2, scales = "free") +
+  labs(x = "tf-idf", y = NULL, title = "Most dominant description words")
+```
+
+```{r, eval = FALSE}
+#now analysing the titles of the amazon products
+#tokenizing
+tidy_title <- cleandata %>%
+  unnest_tokens(word, title)
+
+
+tidy_title <- tidy_title %>% 
+  anti_join(allstopwords)
+
+tidy_title
+```
+
+```{r, eval = FALSE}
+#word count for titles in each star ranking
+title_words <- tidy_title %>%
+  count(overall, word, sort = TRUE)
+```
+
+```{r, eval = FALSE}
+#gives table of total words in each review category for title
+total_title_words <- title_words %>% 
+  group_by(overall) %>% 
+  summarize(total = sum(n))
+
+```
+
+```{r, eval = FALSE}
+#joining to total words
+title_words <- title_words %>% 
+  left_join(total_title_words)
+
+```
+
+```{r, eval = FALSE}
+#plotting word frequencies
+title_words %>% 
+  mutate(tf = n/total) %>% 
+  ggplot(aes(x=tf,fill=overall))+
+  geom_histogram(show.legend = FALSE)+
+  xlim(0,0.0009)+
+  facet_wrap(overall~.,ncol=2,scales = "free_y")
+```
+
+```{r, eval = FALSE}
+#Zipfs law and frequency ranks  for the titles
+title_words %>% 
+  group_by(overall) %>% 
+  mutate(rank = row_number(), 
+         tf = n/total) %>% 
+  ungroup() -> zipf_data_title
+```
+
+```{r, eval = FALSE}
+#plotting results
+zipf_data_title %>% 
+  ggplot(aes(rank, tf, color = overall)) + 
+  geom_line(size = 1.1, alpha = 0.8, show.legend = TRUE) + 
+  scale_x_log10() +
+  scale_y_log10() + 
+  coord_equal()
+```
+
+```{r, eval = FALSE}
+#calculating TF-IDF
+ title_tf_idf <- title_words %>% 
+      bind_tf_idf(word,overall,n) %>% 
+      dplyr::select(-total) 
+```
+
+```{r, eval = FALSE}
+#plotting
+title_tf_idf %>%
+  group_by(overall) %>%
+  slice_max(tf_idf, n = 10) %>%
+  ungroup() %>%
+  ggplot(aes(tf_idf, reorder(word, tf_idf), fill = overall)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~overall, ncol = 2, scales = "free") +
+  labs(x = "tf-idf", y = NULL, title = "Most dominant title words per star rating")
+```
+
+```{r, eval = FALSE}
+#Now we start with the analysis of the words in the description column
+#most common words in the description column
+wordcountdes <- tidy_description %>% 
+  count(word,sort = TRUE) 
+```
+
+```{r, eval = FALSE}
+#First we will most dominant words per star category in the product descriptions
+#interactive graph showing the frequency of the words for description
+#this shows the most common words used over all reviews 
+tidy_description  %>%
+  count(word, sort = TRUE) %>%
+  head(100) %>%
+  wordcloud2(size = 0.4, shape = 'triangle forward', color = c("blue", "black", "darkorchid"), backgroundColor = "yellow")
+```
+
+```{r, eval = FALSE}
+#making a sub table just made up of the 1 star reviews 
+onestardes <- subset(tidy_description, overall==1)
+
+#this makes a interactive wordcloud showing the most common words in the one star de
+onestardes  %>%
+  count(word, sort = TRUE) %>%
+  head(100) %>%
+  wordcloud2(size = 0.4, shape = 'triangle forward', color = c("blue", "black", "darkorchid"), backgroundColor = "white")
+
+
+```
+
+```{r, eval = FALSE}
+#sub-setting the two star data
+twostardes <- subset(tidy_description, overall==2)
+#word cloud for the most common words in the descriptions for the two star reviews
+twostardes  %>%
+  count(word, sort = TRUE) %>%
+  head(100) %>%
+  wordcloud2(size = 0.4, shape = 'triangle forward', color = c("blue", "black", "darkorchid"), backgroundColor = "white")
+```
+
+```{r, eval = FALSE}
+#subset three star reviews
+threestardes <- subset(tidy_description, overall==3)
+#wordcloud
+threestardes  %>%
+  count(word, sort = TRUE) %>%
+  head(100) %>%
+  wordcloud2(size = 0.4, shape = 'triangle forward', color = c("blue", "black", "darkorchid"), backgroundColor = "white")
+```
+
+```{r, eval = FALSE}
+#subset
+fourstardes <- subset(tidy_description, overall==4)
+#wordcloud
+fourstardes  %>%
+  count(word, sort = TRUE) %>%
+  head(100) %>%
+  wordcloud2(size = 0.4, shape = 'triangle forward', color = c("blue", "black", "darkorchid"), backgroundColor = "white")
+```
+
+```{r, eval = FALSE}
+#subset
+fivestardes <- subset(tidy_description, overall==5)
+#wordcloud
+fivestardes  %>%
+  count(word, sort = TRUE) %>%
+  head(100) %>%
+  wordcloud2(size = 0.4, shape = 'triangle forward', color = c("blue", "black", "darkorchid"), backgroundColor = "white")
+```
+
+```{r, eval = FALSE}
+#numeric word count for each star review in each star category description.
+onestardes %>% 
+  count(word,sort = TRUE) 
+
+twostardes %>% 
+  count(word,sort = TRUE)
+
+
+threestardes %>% 
+  count(word,sort = TRUE)
+
+fourstardes %>% 
+  count(word,sort = TRUE)
+
+fivestardes %>% 
+  count(word,sort = TRUE)
+```
+
+```{r, eval = FALSE}
+#Now we look at the most dominant words per star category in the reviews
+#interactive graph showing the frequency of the words in the review text
+tidy_review  %>%
+  count(word, sort = TRUE) %>%
+  head(100) %>%
+  wordcloud2(size = 0.4, shape = 'triangle forward', color = c("blue", "black", "darkorchid"), backgroundColor = "salmon")
+  
+```
+
+```{r, eval = FALSE}
+#filter out the one star reviews to find dominant words per star rating
+onestarrev <- subset(tidy_review, overall==1)
+#word cloud
+onestarrev  %>%
+  count(word, sort = TRUE) %>%
+  head(100) %>%
+  wordcloud2(size = 0.4, shape = 'triangle forward', color = c("blue", "black", "darkorchid"), backgroundColor = "white")
+
+```
+
+```{r, eval = FALSE}
+#filter two star reviews and make word cloud
+twostarrev <- subset(tidy_review, overall==2)
+#wordcloud
+twostarrev  %>%
+  count(word, sort = TRUE) %>%
+  head(100) %>%
+  wordcloud2(size = 0.4, shape = 'triangle forward', color = c("blue", "black", "darkorchid"), backgroundColor = "white")
+
+```
+
+```{r, eval = FALSE}
+#subset three star for review text
+threestarrev <- subset(tidy_review, overall==3)
+#wordcloud
+threestarrev  %>%
+  count(word, sort = TRUE) %>%
+  head(100) %>%
+  wordcloud2(size = 0.4, shape = 'triangle forward', color = c("blue", "black", "darkorchid"), backgroundColor = "white")
+```
+
+```{r, eval = FALSE}
+#four star
+fourstarrev <- subset(tidy_review, overall==4)
+#wordcloud
+fourstarrev  %>%
+  count(word, sort = TRUE) %>%
+  head(100) %>%
+  wordcloud2(size = 0.4, shape = 'triangle forward', color = c("blue", "black", "darkorchid"), backgroundColor = "white")
+```
+
+```{r, eval = FALSE}
+#five star
+fivestarrev <- subset(tidy_review, overall==5)
+#wordcloud
+fivestarrev  %>%
+  count(word, sort = TRUE) %>%
+  head(100) %>%
+  wordcloud2(size = 0.4, shape = 'triangle forward', color = c("blue", "black", "darkorchid"), backgroundColor = "white")
+```
+
+```{r, eval = FALSE}
+#word count for most dominant words in the review texts per star category
+onestarrev %>% 
+  count(word,sort = TRUE) 
+
+twostarrev %>% 
+  count(word,sort = TRUE)
+
+
+threestarrev %>% 
+  count(word,sort = TRUE)
+
+fourstarrev %>% 
+  count(word,sort = TRUE)
+
+fivestarrev %>% 
+  count(word,sort = TRUE)
+```
+
+```{r, eval = FALSE}
+#word count for all reviews
+
+wordcountrev <- tidy_review %>% 
+  count(word,sort = TRUE) 
+```
+
+```{r, eval = FALSE}
+#word occurances per star review
+
+tidy_review %>%
+  group_by(overall) %>%
+  count(word) -> word_occurences_per_star 
+```
+
+```{r, eval = FALSE}
+#length of each review
+tidy_review %>% 
+  group_by(overall) %>% 
+  summarise(total_words=n()) %>% 
+  dplyr::select(overall,total_words)-> all_review_length
+```
+
+```{r, eval = FALSE}
+#proportion of toekn used by the review
+tidy_review %>% 
+  group_by(overall) %>% 
+  count(word,sort = TRUE) %>% 
+  left_join(all_review_length) %>% 
+  mutate(prop = n/total_words) %>% 
+  dplyr::select(overall,word,prop) -> allreviewtokenprop
+
+```
+
+```{r, eval = FALSE}
+#proportions for review words
+allreviewtokenprop %>% arrange(desc(prop)) %>% 
+      top_n(20) %>% 
+      mutate(word=as.factor(word)) %>% 
+      ggplot(.,aes(x=reorder(word,prop),y=prop,color=overall))+
+      geom_point(stat="identity")+coord_flip()
+```
+
+```{r, eval = FALSE}
+#proportions accross all review ratings for review words
+allreviewtokenprop %>% arrange(desc(prop)) %>% 
+      top_n(10) %>% 
+      mutate(word=as.factor(word)) %>% 
+      ggplot(.,aes(x=reorder(word,prop),y=prop,color=overall))+
+      geom_point(stat="identity")+
+  geom_smooth()+coord_flip()+
+  facet_wrap(overall~.)+
+  theme(legend.position = "none")
+```
+
+```{r, eval = FALSE}
+#word count for all reviews
+
+wordcountrev <- tidy_description %>% 
+  count(word,sort = TRUE) 
+```
+
+```{r, eval = FALSE}
+#in description word occurances per star review
+
+tidy_description %>%
+  group_by(overall) %>%
+  count(word) -> desword_occurences_per_star 
+```
+
+```{r, eval = FALSE}
+#length of each review
+tidy_description %>% 
+  group_by(overall) %>% 
+  summarise(total_words=n()) %>% 
+  dplyr::select(overall,total_words)-> all_description_length
+```
+
+```{r, eval = FALSE}
+#proportion of toekn used by the review
+tidy_description %>% 
+  group_by(overall) %>% 
+  count(word,sort = TRUE) %>% 
+  left_join(all_review_length) %>% 
+  mutate(prop = n/total_words) %>% 
+  dplyr::select(overall,word,prop) -> alldescriptiontokenprop
+
+```
+
+```{r, eval = FALSE}
+#proportions for description words
+alldescriptiontokenprop %>% arrange(desc(prop)) %>% 
+      top_n(20) %>% 
+      mutate(word=as.factor(word)) %>% 
+      ggplot(.,aes(x=reorder(word,prop),y=prop,color=overall))+
+      geom_point(stat="identity")+coord_flip()
+```
+
+```{r, eval = FALSE}
+#proportions accross all review ratings for description words
+alldescriptiontokenprop %>% arrange(desc(prop)) %>% 
+      top_n(10) %>% 
+      mutate(word=as.factor(word)) %>% 
+      ggplot(.,aes(x=reorder(word,prop),y=prop,color=overall))+
+      geom_point(stat="identity")+
+  geom_smooth()+coord_flip()+
+  facet_wrap(overall~.)+
+  theme(legend.position = "none")
+
+
+```
+
+```{r, eval = FALSE}
+#plot showing the top 25 words in the review text
+toptwentyrevwords <- wordcountrev %>%
+  top_n(25, n) %>% 
+  mutate(word=as.factor(word)) 
+
+
+ggplot(data = toptwentyrevwords, mapping = aes(x = reorder(word, +n), y = n)) + geom_bar(stat="identity", fill="steelblue") + theme_minimal() + coord_flip() + labs(title = "Common words in Review Text", x = "word", y = "Word Count")
+```
+
+```{r, eval = FALSE}
+#plot showing the top 25 words in the description text
+toptwentydeswords <- wordcountdes %>%
+  top_n(25, n) %>% 
+  mutate(word=as.factor(word)) 
+
+
+ggplot(data = toptwentydeswords, mapping = aes(x = reorder(word, +n), y = n)) + geom_bar(stat="identity", fill="#AC88FF") + theme_minimal() + coord_flip() + labs(title = "Common words in Description Text", x = "Word", y = "Word Count") 
+
+```
+
+## Part A - Question B
+
+```{r , eval = FALSE}
+#Word Combinations for reviewText
+data <- read_csv("Cleaned_H&K_Data_updated.csv")
+reviewText <- select(data, overall, price, reviewText)
+
+reviewText <- reviewText %>% mutate(overall=as.numeric(overall), price=as.numeric(price))
+#Splitting into different price levels
+reviewText <- reviewText %>% mutate(price_level=
+  ifelse (price<=5,"0-5",
+  ifelse (price>5 & price<=10,"5-10",
+  ifelse (price>10 & price<=15,"10-15",
+  ifelse (price>15 & price<=20,"15-20",
+  ifelse (price>20 & price<=40,"20-40",
+  ifelse (price>40 & price<=100,"40-100",
+  ifelse (price>100,"100+",NA))))))))
+
+id <- 1:nrow(reviewText)
+reviewText <- data.frame(id, reviewText)
+
+#reviewText <- reviewText %>% filter(grepl("NA NA NA", reviewText, ignore.case = F))
+
+tokenText <- 
+  reviewText %>% unnest_tokens(word, reviewText) 
+tokenText  %>% count(word,sort = TRUE)
+
+#data("stop_words")
+tokenText <- tokenText %>% anti_join(stop_words)
+```
+
+```{r, eval = FALSE}
+#Unigrams extraction for each rating category
+reviewText %>%
+  unnest_tokens(word,reviewText,token="ngrams",n=1) -> unigram
+  
+unigram <- unigram %>%
+  anti_join(stop_words)
+
+unigram %>%
+  na.omit() %>%
+  count(overall,word,sort=TRUE) %>%
+  bind_tf_idf(word,overall,n) %>%
+  arrange(desc(tf_idf)) -> unigram_tf_idf_ov
+
+unigram_tf_idf_ov %>%
+  group_by(overall) %>%
+  slice_max(tf_idf,n=10) %>%
+  ungroup() %>%
+  ggplot(aes(tf_idf, reorder(word, tf_idf), fill = overall)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~overall, ncol = 3, scales = "free") +
+  labs(x = "tf-idf", y = NULL, title="Most Important Unigram Per Rating Category for Review Text")
+
+unigram_tf_idf_ov <-unigram_tf_idf_ov %>% arrange(desc(n))
+
+unigram_tf_idf_ov %>%
+  group_by(overall) %>%
+  slice_max(n,n=10) %>%
+  ungroup() %>%
+  ggplot(aes(n, reorder(word,n), fill = overall)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~overall, ncol = 3, scales = "free") +
+  labs(x = "frequency", y = NULL, title="Most Common Unigram Per Rating Category for Review Text")
+```
+
+```{r, eval = FALSE}
+#Unigram analysis for each price level
+unigram %>%
+  na.omit() %>%
+  count(price_level,word,sort=TRUE) %>%
+  bind_tf_idf(word,price_level,n) %>%
+  arrange(desc(tf_idf)) -> unigram_tf_idf_pri
+
+unigram_tf_idf_pri %>%
+  group_by(price_level) %>%
+  slice_max(tf_idf,n=10) %>%
+  ungroup() %>%
+  ggplot(aes(tf_idf, reorder(word, tf_idf), fill = price_level)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~price_level, ncol = 3, scales = "free") +
+  labs(x = "tf-idf", y = NULL, title="Most Important Unigram Per Price Level for Review Text")
+
+unigram_tf_idf_pri %>%
+  group_by(price_level) %>%
+  slice_max(n,n=10) %>%
+  ungroup() %>%
+  ggplot(aes(n, reorder(word, n), fill = price_level)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~price_level, ncol = 3, scales = "free") +
+  labs(x = "frequency", y = NULL, title="Most Common Unigram Per Price Level for Review Text")
+```
+
+```{r, eval = FALSE}
+#Bigrams extraction for each rating category
+reviewText %>%
+  unnest_tokens(word,reviewText,token="ngrams",n=2) -> bigram
+
+bigram <- bigram %>%
+  separate(word, c("word", "word2"), sep = " ")
+bigram <- bigram %>% anti_join(stop_words)
+names(bigram) <- c("id", "overall", "price", "price_level", "word1","word")
+bigram <- bigram %>% anti_join(stop_words)
+bigram <- bigram %>%
+  unite("word", word1, word, sep=" ")
+
+bigram %>%
+  na.omit() %>%
+  count(overall,word,sort=TRUE) %>%
+  bind_tf_idf(word,overall,n) %>%
+  arrange(desc(tf_idf)) -> bigram_tf_idf_ov
+
+bigram_tf_idf_ov %>%
+  group_by(overall) %>%
+  slice_max(tf_idf,n=10) %>%
+  ungroup() %>%
+  ggplot(aes(tf_idf, reorder(word, tf_idf), fill = overall)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~overall, ncol = 3, scales = "free") +
+  labs(x = "tf-idf", y = NULL, title="Most Important Bigram Per Rating Category for Review Text")
+
+bigram_tf_idf_ov %>%
+  group_by(overall) %>%
+  slice_max(n,n=10) %>%
+  ungroup() %>%
+  ggplot(aes(n, reorder(word, n), fill = overall)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~overall, ncol = 3, scales = "free") +
+  labs(x = "frequency", y = NULL, title="Most Common Bigram Per Rating Category for Review Text")
+```
+
+```{r, eval = FALSE}
+#Bigrams extraction for each price level
+bigram %>%
+  na.omit() %>%
+  count(price_level,word,sort=TRUE) %>%
+  bind_tf_idf(word,price_level,n) %>%
+  arrange(desc(tf_idf)) -> bigram_tf_idf_pri
+
+bigram_tf_idf_pri %>%
+  group_by(price_level) %>%
+  slice_max(tf_idf,n=10) %>%
+  ungroup() %>%
+  ggplot(aes(tf_idf, reorder(word, tf_idf), fill = price_level)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~price_level, ncol = 3, scales = "free") +
+  labs(x = "tf-idf", y = NULL, title="Most Important Bigram Per Price Level for Review Text")
+
+bigram_tf_idf_pri %>%
+  group_by(price_level) %>%
+  slice_max(n,n=10) %>%
+  ungroup() %>%
+  ggplot(aes(n, reorder(word, n), fill = price_level)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~price_level, ncol = 3, scales = "free") +
+  labs(x = "frequency", y = NULL, title="Most Common Bigram Per Price Level for Review Text")
+```
+
+```{r, eval = FALSE}
+#Trigram extraction for each rating category
+reviewText %>%
+  unnest_tokens(word,reviewText,token="ngrams",n=3) -> trigram
+
+trigram <- trigram %>%
+  separate(word, c("word", "word2","word3"), sep = " ")
+trigram <- trigram %>% anti_join(stop_words)
+names(trigram) <- c("id", "overall", "price", "price_level", "word1","word","word3")
+trigram <- trigram %>% anti_join(stop_words)
+names(trigram) <- c("id", "overall", "price", "price_level", "word1","word2","word")
+trigram <- trigram %>% anti_join(stop_words)
+trigram <- trigram %>%
+  unite("word", word1, word2, word, sep=" ")
+
+trigram %>%
+  na.omit() %>%
+  count(overall,word,sort=TRUE) %>%
+  bind_tf_idf(word,overall,n) %>%
+  arrange(desc(tf_idf)) -> trigram_tf_idf_ov
+
+trigram_tf_idf_ov %>%
+  group_by(overall) %>%
+  slice_max(tf_idf,n=10) %>%
+  ungroup() %>%
+  ggplot(aes(tf_idf, reorder(word, tf_idf), fill = overall)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~overall, ncol = 3, scales = "free") +
+  labs(x = "tf-idf", y = NULL, title="Most Important Trigram Per Rating Category for Review Text")
+
+trigram_tf_idf_ov %>%
+  group_by(overall) %>%
+  slice_max(n,n=10) %>%
+  ungroup() %>%
+  ggplot(aes(n, reorder(word, n), fill = overall)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~overall, ncol = 3, scales = "free") +
+  labs(x = "frequency", y = NULL, title="Most Common Trigram Per Rating Category for Review Text")
+```
+
+```{r, eval = FALSE}
+#Trigrams extraction for each price level
+trigram %>%
+  na.omit() %>%
+  count(price_level,word,sort=TRUE) %>%
+  bind_tf_idf(word,price_level,n) %>%
+  arrange(desc(tf_idf)) -> trigram_tf_idf_pri
+
+trigram_tf_idf_pri %>%
+  group_by(price_level) %>%
+  slice_max(tf_idf,n=10) %>%
+  ungroup() %>%
+  ggplot(aes(tf_idf, reorder(word, tf_idf), fill = price_level)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~price_level, ncol = 3, scales = "free") +
+  labs(x = "tf-idf", y = NULL, title="Most Important Trigram Per Price Level for Review Text")
+
+trigram_tf_idf_pri %>%
+  group_by(price_level) %>%
+  slice_max(n,n=10) %>%
+  ungroup() %>%
+  ggplot(aes(n, reorder(word, n), fill = price_level)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~price_level, ncol = 3, scales = "free") +
+  labs(x = "frequency", y = NULL, title="Most Common Trigram Per Price Level for Review Text")
+
+```
+
+```{r, eval = FALSE}
+#Fingind association base on rating category
+#rate_tf_idf <- rate_tf_idf %>% filter(overall==1)
+
+rate_dtm_tfidf_ov <- rate_tf_idf_ov %>% cast_dtm(overall, word, tf_idf)
+
+rate_dtm_tfidf_sparse_ov = removeSparseTerms(rate_dtm_tfidf_ov,0.50)
+as.matrix(rate_dtm_tfidf_sparse_ov)[1:5,1:10]
+
+findAssocs(rate_dtm_tfidf_sparse_ov, "apology", 0.1)
+
+findAssocs(rate_dtm_tfidf_sparse_ov, colnames(rate_dtm_tfidf_sparse_ov)[1:200], 0.5)
+
+#CLustering words based on rating category
+clustering.kmeans_term_ov <- kmeans(na.omit(t(as.matrix(rate_dtm_tfidf_sparse_ov))), 5)
+clustering.kmeans_term_ov$cluster
+
+
+#fviz_cluster(clustering.kmeans_term_ov, data = na.omit(t(as.matrix(rate_dtm_tfidf_sparse_ov))), 
+#             geom = "text",
+#             ellipse.type = "convex", 
+#             ggtheme = theme_bw()
+#             )
+
+```
+
+```{r, eval = FALSE}
+#find association based on price level
+rate_dtm_tfidf_pri <- rate_tf_idf_pri %>% cast_dtm(price_level, word, tf_idf)
+
+rate_dtm_tfidf_sparse_pri = removeSparseTerms(rate_dtm_tfidf_pri,0.99)
+as.matrix(rate_dtm_tfidf_sparse_pri)[1:5,1:20]
+
+findAssocs(rate_dtm_tfidf_sparse_pri, "apology", 0.1)
+
+findAssocs(rate_dtm_tfidf_sparse_pri, colnames(rate_dtm_tfidf_sparse_pri)[1:100], 0.1)
+
+#cluster words based on price level
+clustering.kmeans_term_pri <- kmeans(na.omit(t(as.matrix(rate_dtm_tfidf_sparse_pri))), 5)
+clustering.kmeans_term_pri$cluster
+```
+
+```{r, eval = FALSE}
+#find word correlation for unigram
+word_list <- tokenText %>%
+  count(word, name = "n", sort = TRUE) %>%
+  filter(n >= 150)
+
+word_ass <- tokenText %>%
+  semi_join(word_list, by = "word") %>%
+  pairwise_cor(item = word, feature = id) %>%
+  filter(correlation >= 0.5)
+
+graph_from_data_frame(d = word_ass,
+                      vertices = word_list %>%
+                        semi_join(word_ass, by = c("word" = "item1"))) %>%
+  ggraph(layout = "fr") +
+  geom_edge_link(aes(alpha = correlation)) +
+  geom_node_point() +
+  geom_node_text(aes(color = n, label = name), repel = TRUE) +
+  labs(title="Word Correlations In Unigram for Review Text") +
+  theme(plot.title = element_text(hjust = 0.4))
+  #theme(legend.position="none")
+
+```
+
+```{r, eval = FALSE}
+#find word correlation for bigram
+word_list2 <- bigram %>%
+  count(word, name = "n", sort = TRUE) %>%
+  filter(n >= 100)
+
+word_ass2 <- bigram %>%
+  semi_join(word_list2, by = "word") %>%
+  pairwise_cor(item = word, feature = id) %>%
+  filter(correlation >= 0.5)
+
+graph_from_data_frame(d = word_ass2,
+                      vertices = word_list2 %>%
+                        semi_join(word_ass2, by = c("word" = "item1"))) %>%
+  ggraph(layout = "fr") +
+  geom_edge_link(aes(alpha = correlation)) +
+  geom_node_point() +
+  geom_node_text(aes(color = n, label = name), repel = TRUE) +
+  labs(title="Word Correlations In Bigram for Review Text") +
+  theme(plot.title = element_text(hjust = 0.6))
+  #theme(legend.position="none")
+```
+
+```{r , eval = FALSE}
+#Word Combinations for Description text
+#data <- read.csv("Cleaned_H&K_Data_updated.csv")
+description <- select(data, overall, price, description)
+
+description <- description %>% mutate(overall=as.numeric(overall), price=as.numeric(price))
+
+description <- description %>% group_by(description, price) %>%
+  summarise(av_overall = mean(overall))
+
+id <- 1:nrow(description)
+description <- data.frame(id, description)
+
+#label different prodects based on price
+description <- description %>% mutate(price_level=
+  ifelse (price<=5,"0-5",
+  ifelse (price>5 & price<=10,"5-10",
+  ifelse (price>10 & price<=15,"10-15",
+  ifelse (price>15 & price<=20,"15-20",
+  ifelse (price>20 & price<=40,"20-40",
+  ifelse (price>40 & price<=100,"40-100",
+  ifelse (price>100,"100+",NA))))))))
+
+#label different products based on average overall rating
+description <- description %>% mutate(rate_level=
+  ifelse (av_overall<=4,"low",
+  ifelse (av_overall>4 & av_overall<=4.5,"medium",
+  ifelse (av_overall>4.5 & av_overall<=5,"high",NA))))
+
+#tokenText_dscp <- 
+#  description %>% unnest_tokens(word, description) 
+#tokenText_dscp  %>% count(word,sort = TRUE)
+
+#data("stop_words")
+#tokenText_dscp <- tokenText_dscp %>% anti_join(stop_words)
+```
+
+```{r, eval = FALSE}
+#unigram extraction for rating category
+description %>%
+  unnest_tokens(word,description,token="ngrams",n=1) -> unigram_dscp
+  
+#unigram_dscp <- unigram_dscp %>% anti_join(stop_words)
+
+unigram_dscp %>%
+  na.omit() %>%
+  count(rate_level,word,sort=TRUE) %>%
+  bind_tf_idf(word,rate_level,n) %>%
+  arrange(desc(tf_idf)) -> unigram_tf_idf_ov_dscp
+
+unigram_tf_idf_ov_dscp %>%
+  group_by(rate_level) %>%
+  slice_max(tf_idf,n=10) %>%
+  ungroup() %>%
+  ggplot(aes(tf_idf, reorder(word, tf_idf), fill = rate_level)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~rate_level, ncol = 3, scales = "free") +
+  labs(x = "tf-idf", y = NULL, title="Most Important Unigram Per Rating Category for Description")
+
+unigram_tf_idf_ov_dscp <-unigram_tf_idf_ov_dscp %>% arrange(desc(n))
+
+unigram_tf_idf_ov_dscp %>%
+  group_by(rate_level) %>%
+  slice_max(n,n=10) %>%
+  ungroup() %>%
+  ggplot(aes(n, reorder(word,n), fill = rate_level)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~rate_level, ncol = 3, scales = "free") +
+  labs(x = "frequency", y = NULL, title="Most Common Unigram Per Rating Category for Description")
+```
+
+```{r, eval = FALSE}
+#unigram extraction for price level
+unigram_dscp %>%
+  na.omit() %>%
+  count(price_level,word,sort=TRUE) %>%
+  bind_tf_idf(word,price_level,n) %>%
+  arrange(desc(tf_idf)) -> unigram_tf_idf_pri_dscp
+
+unigram_tf_idf_pri_dscp %>%
+  group_by(price_level) %>%
+  slice_max(tf_idf,n=10) %>%
+  ungroup() %>%
+  ggplot(aes(tf_idf, reorder(word, tf_idf), fill = price_level)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~price_level, ncol = 3, scales = "free") +
+  labs(x = "tf-idf", y = NULL, title="Most Important Unigram Per Price Level for Description")
+
+unigram_tf_idf_pri_dscp %>%
+  group_by(price_level) %>%
+  slice_max(n,n=10) %>%
+  ungroup() %>%
+  ggplot(aes(n, reorder(word, n), fill = price_level)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~price_level, ncol = 3, scales = "free") +
+  labs(x = "frequency", y = NULL, title="Most Common Unigram Per Price Level for Description")
+```
+
+```{r, eval = FALSE} 
+#bigram extraction for rating category
+description %>%
+  unnest_tokens(word,description,token="ngrams",n=2) -> bigram_dscp
+
+bigram_dscp <- bigram_dscp %>%
+  separate(word, c("word", "word2"), sep = " ")
+bigram_dscp <- bigram_dscp %>% anti_join(stop_words)
+names(bigram_dscp) <- c("id", "price","av_overall","price_level","rate_level", "word1","word")
+bigram_dscp <- bigram_dscp %>% anti_join(stop_words)
+bigram_dscp <- bigram_dscp %>%
+  unite("word", word1, word, sep=" ")
+
+bigram_dscp %>%
+  na.omit() %>%
+  count(rate_level,word,sort=TRUE) %>%
+  bind_tf_idf(word,rate_level,n) %>%
+  arrange(desc(tf_idf)) -> bigram_tf_idf_ov_dscp
+
+bigram_tf_idf_ov_dscp %>%
+  group_by(rate_level) %>%
+  slice_max(tf_idf,n=10) %>%
+  ungroup() %>%
+  ggplot(aes(tf_idf, reorder(word, tf_idf), fill = rate_level)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~rate_level, ncol = 3, scales = "free") +
+  labs(x = "tf-idf", y = NULL, title="Most Important Bigram Per Rating Category for Description")
+
+bigram_tf_idf_ov_dscp %>%
+  group_by(rate_level) %>%
+  slice_max(n,n=10) %>%
+  ungroup() %>%
+  ggplot(aes(n, reorder(word, n), fill = rate_level)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~rate_level, ncol = 3, scales = "free") +
+  labs(x = "frequency", y = NULL, title="Most Common Bigram Per Rating Category for Description")
+```
+
+```{r, eval = FALSE}
+#bigram extraction for price level
+bigram_dscp %>%
+  na.omit() %>%
+  count(price_level,word,sort=TRUE) %>%
+  bind_tf_idf(word,price_level,n) %>%
+  arrange(desc(tf_idf)) -> bigram_tf_idf_pri_dscp
+
+bigram_tf_idf_pri_dscp %>%
+  group_by(price_level) %>%
+  slice_max(tf_idf,n=10) %>%
+  ungroup() %>%
+  ggplot(aes(tf_idf, reorder(word, tf_idf), fill = price_level)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~price_level, ncol = 3, scales = "free") +
+  labs(x = "tf-idf", y = NULL, title="Most Important Bigram Per Price Level for Description")
+
+bigram_tf_idf_pri_dscp %>%
+  group_by(price_level) %>%
+  slice_max(n,n=10) %>%
+  ungroup() %>%
+  ggplot(aes(n, reorder(word, n), fill = price_level)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~price_level, ncol = 3, scales = "free") +
+  labs(x = "frequency", y = NULL, title="Most Common Bigram Per Price Level for Description")
+```
+
+```{r, eval = FALSE}
+#trigram extraction fro rating category
+description %>%
+  unnest_tokens(word,description,token="ngrams",n=3) -> trigram_dscp
+
+trigram_dscp <- trigram_dscp %>%
+  separate(word, c("word", "word2","word3"), sep = " ")
+trigram_dscp <- trigram_dscp %>% anti_join(stop_words)
+names(trigram_dscp) <- c("id","price","av_overall","price_level","rate_level","word1","word","word3")
+trigram_dscp <- trigram_dscp %>% anti_join(stop_words)
+names(trigram_dscp) <- c("id","price","av_overall","price_level","rate_level","word1","word2","word")
+trigram_dscp <- trigram_dscp %>% anti_join(stop_words)
+trigram_dscp <- trigram_dscp %>%
+  unite("word", word1, word2, word, sep=" ")
+
+trigram_dscp %>%
+  na.omit() %>%
+  count(rate_level,word,sort=TRUE) %>%
+  bind_tf_idf(word,rate_level,n) %>%
+  arrange(desc(tf_idf)) -> trigram_tf_idf_ov_dscp
+
+trigram_tf_idf_ov_dscp %>%
+  group_by(rate_level) %>%
+  slice_max(tf_idf,n=10) %>%
+  ungroup() %>%
+  ggplot(aes(tf_idf, reorder(word, tf_idf), fill = rate_level)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~rate_level, ncol = 5, scales = "free") +
+  labs(x = "tf-idf", y = NULL, title="Most Important Trigram Per Rating Category for Description")
+
+trigram_tf_idf_ov_dscp %>%
+  group_by(rate_level) %>%
+  slice_max(n,n=10) %>%
+  ungroup() %>%
+  ggplot(aes(n, reorder(word, n), fill = rate_level)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~rate_level, ncol = 5, scales = "free") +
+  labs(x = "frequency", y = NULL, title="Most Common Trigram Per Rating Category for Description")
+```
+
+```{r, eval = FALSE}
+#trigram extraction for price level
+trigram_dscp %>%
+  na.omit() %>%
+  count(price_level,word,sort=TRUE) %>%
+  bind_tf_idf(word,price_level,n) %>%
+  arrange(desc(tf_idf)) -> trigram_tf_idf_pri_dscp
+
+trigram_tf_idf_pri_dscp %>%
+  group_by(price_level) %>%
+  slice_max(tf_idf,n=10) %>%
+  ungroup() %>%
+  ggplot(aes(tf_idf, reorder(word, tf_idf), fill = price_level)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~price_level, ncol = 3, scales = "free") +
+  labs(x = "tf-idf", y = NULL, title="Most Important Trigram Per Price Level for Description")
+
+trigram_tf_idf_pri_dscp %>%
+  group_by(price_level) %>%
+  slice_max(n,n=10) %>%
+  ungroup() %>%
+  ggplot(aes(n, reorder(word, n), fill = price_level)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~price_level, ncol = 3, scales = "free") +
+  labs(x = "frequency", y = NULL, title="Most Common Trigram Per Price Level for Description")
+
+```
+
+```{r, eval = FALSE}
+#find word association based on rating category
+#rate_tf_idf <- rate_tf_idf %>% filter(overall==1)
+
+rate_dtm_tfidf_ov_dscp <- rate_tf_idf_ov_dscp %>% cast_dtm(rate_level, word, tf_idf)
+
+rate_dtm_tfidf_sparse_ov_dscp = removeSparseTerms(rate_dtm_tfidf_ov_dscp,0.5)
+as.matrix(rate_dtm_tfidf_sparse_ov_dscp)[1:5,1:20]
+
+findAssocs(rate_dtm_tfidf_sparse_ov_dscp, "big", 0.0)
+
+findAssocs(rate_dtm_tfidf_sparse_ov_dscp, colnames(rate_dtm_tfidf_sparse_ov_dscp)[1:100], 0.1)
+
+#cluster word based on rating category
+clustering.kmeans_term_ov_dscp <- kmeans(t(as.matrix(rate_dtm_tfidf_sparse_ov_dscp)), 3)
+clustering.kmeans_term_ov_dscp$cluster
+
+```
+
+```{r, eval = FALSE}
+#find word associoation based on price level
+rate_dtm_tfidf_pri_dscp <- rate_tf_idf_pri_dscp %>% cast_dtm(price_level, word, tf_idf)
+
+rate_dtm_tfidf_sparse_pri_dscp = removeSparseTerms(rate_dtm_tfidf_pri_dscp,0.99)
+as.matrix(rate_dtm_tfidf_sparse_pri_dscp)[1:5,1:20]
+
+#findAssocs(rate_dtm_tfidf_sparse, "apologies", 0.1)
+
+findAssocs(rate_dtm_tfidf_sparse_pri_dscp, colnames(rate_dtm_tfidf_sparse_pri_dscp)[1:100], 0.1)
+
+#cluster word based on price level
+clustering.kmeans_term_pri_dscp <- kmeans(na.omit(t(as.matrix(rate_dtm_tfidf_sparse_pri_dscp))), 3)
+clustering.kmeans_term_pri_dscp$cluster
+
+```
+
+## Part A - Question C
+
+```{r, eval = FALSE}
+# load the clean data
+cleandata <- read_csv("Cleaned_H&K_Data_updated.csv")
+```
+
+```{r, eval = FALSE}
+#normalizing the data
+cleandata$review_id <- 1:nrow(cleandata)
+
+# subtract the columns needed
+reviewtext<- cleandata[,c("review_id","reviewText","overall","title","description","brand","categories")]
+
+#Factoring overall column into an ordered factor
+reviewtext$overall <- factor(reviewtext$overall, order = TRUE, levels = c(1,2,3,4,5))
+
+```
+
+## evaluating the effect of brand mentioning in reviews on ratings
+
+```{r, eval = FALSE}
+#Converting the brand column to lowercase
+reviewtext$brand <- tolower(reviewtext$brand)
+
+# Add the column for mentioning the brand or not
+reviewtext <- reviewtext %>%
+  mutate(name = str_detect(reviewtext$reviewText, brand))
+
+# calculate the proportion of brand mentioning
+reviewtext <- reviewtext %>%
+  group_by(brand) %>%
+  mutate(brand_prop = sum(name)/n()) %>%
+    ungroup
+
+# plot the proportion of brand mentioning in reviews
+reviewtext %>% ggplot(.,aes(x = brand_prop,
+                         y = overall))+
+  geom_point(alpha=0.2) +
+  geom_smooth(method="lm") +
+  ggtitle("Rating scores vs brand mentioning proportion")
+
+# cor test
+cor.test(as.numeric(reviewtext$overall),
+         reviewtext$brand_prop,
+         method = "pearson")
+# p value <0.001, significant positive correlation exists between the rating and the proportion of brand mentioning in reviews
+
+# logistic regression
+brand_m <- polr(overall ~ brand_prop, data = reviewtext, Hess = TRUE)
+summary_table <- coef(summary(brand_m))
+pval <- pnorm(abs(summary_table[, "t value"]),lower.tail = FALSE)* 2
+summary_brand_m <- cbind(summary_table, "p value" = pval)
+
+```
+
+## evaluate the effect of review lengths on ratings
+
+```{r, eval = FALSE}
+# calculate lengths of review , and add the column
+reviewtext <- reviewtext %>%
+  group_by(review_id) %>%
+  mutate(length = nchar(reviewText)) %>%
+    ungroup
+
+# plot
+  reviewtext %>% ggplot(.,aes(x = length,
+                         y = overall))+
+  geom_point(alpha=0.2) +
+  geom_smooth(method="lm") +
+  ggtitle("Rating scores vs review lengths")
+
+# cor test
+cor.test(as.numeric(reviewtext$overall),
+         reviewtext$length,
+         method = "pearson")
+# p value < 0.01, significant negative correlation exists between the rating and the length of reviews
+
+# logistic regression
+length_m <- polr(overall ~ length, data = reviewtext, Hess = TRUE)
+summary_table <- coef(summary(length_m))
+pval <- pnorm(abs(summary_table[, "t value"]),lower.tail = FALSE)* 2
+summary_length_m <- cbind(summary_table, "p value" = pval)
+
+```
+
+## evaluate the effect of title lengths on ratings
+
+```{r, eval = FALSE}
+# Calculate the lengths of title, add the column
+reviewtext <- reviewtext %>%
+  group_by(review_id) %>%
+  mutate(title_length = nchar(title)) %>%
+    ungroup
+
+# plot
+  reviewtext %>% ggplot(.,aes(x = title_length,
+                         y = overall))+
+  geom_point(alpha=0.2) +
+  geom_smooth(method="lm") +
+  ggtitle("Rating scores vs title length")
+
+# cor test
+cor.test(as.numeric(reviewtext$overall),
+         reviewtext$title_length,
+         method = "pearson")
+# p < 0, there is a significant positive correlation between the title lengths and the ratings
+
+# logistic regression
+title_length_m <- polr(overall ~ title_length, data = reviewtext, Hess = TRUE)
+summary_table <- coef(summary(title_length_m))
+pval <- pnorm(abs(summary_table[, "t value"]),lower.tail = FALSE)* 2
+summary_title_length_m <- cbind(summary_table, "p value" = pval)
+
+```
+
+## evaluate the effect of description lengths on ratings
+
+```{r, eval = FALSE}
+# Calculate the lengths of description, add the column
+reviewtext <- reviewtext %>%
+  group_by(review_id) %>%
+  mutate(desc_length = nchar(description)) %>%
+    ungroup
+
+# plot
+  reviewtext %>% ggplot(.,aes(x = desc_length,
+                         y = overall))+
+  geom_point(alpha=0.2) +
+  geom_smooth(method="lm") +
+  ggtitle("Rating scores vs description lengths")
+
+# cor test
+cor.test(as.numeric(reviewtext$overall),
+         reviewtext$desc_length,
+         method = "pearson")
+# p < 0.01, there is negative significant correlation between the description lengths and the ratings
+
+# logistic regression
+desc_length_m <- polr(overall ~ desc_length, data = reviewtext, Hess = TRUE)
+summary_table <- coef(summary(desc_length_m))
+pval <- pnorm(abs(summary_table[, "t value"]),lower.tail = FALSE)* 2
+summary_desc_length_m <- cbind(summary_table, "p value" = pval)
+```
+ 
+## evaluate the effect of dominant word mention proportion in review on ratings
+
+```{r, eval = FALSE}
+# whether the dominant word is mentioned in the description, add the column
+reviewtext <- reviewtext %>%
+  mutate(dominant_mention = str_detect(reviewtext$reviewText, "love"))
+
+# calculate the proportion of dominant word mentioning
+reviewtext <- reviewtext %>%
+  group_by(brand) %>%
+  mutate(dominant_prop = sum(dominant_mention)/n()) %>%
+    ungroup
+
+# plot the proportion of dominant word mentioning
+reviewtext %>% ggplot(.,aes(x = dominant_prop,
+                         y = overall))+
+  geom_point(alpha=0.2) +
+  geom_smooth(method="lm") +
+  ggtitle("Rating scores vs dominant word mention proportion")
+
+# cor test
+cor.test(as.numeric(reviewtext$overall),
+         reviewtext$dominant_prop,
+         method = "pearson")
+# p<0, there is significant positive correlation between the ratings and dominant word mention proportion
+
+# logistic regression
+domi_m <- polr(overall ~ dominant_prop, data = reviewtext, Hess = TRUE)
+summary_table <- coef(summary(domi_m))
+pval <- pnorm(abs(summary_table[, "t value"]),lower.tail = FALSE)* 2
+summary_domi_m <- cbind(summary_table, "p value" = pval)
+```
+
+## evaluate the effect of dominant word mention proportion in description on ratings
+
+```{r, eval = FALSE}
+# whether the dominant word is mentioned in the description, add the column
+reviewtext <- reviewtext %>%
+mutate(dominant_mention_des = str_detect(description, "steel"))
+
+# calculate the proportion of dominant word mentioning
+reviewtext <- reviewtext %>%
+  group_by(brand) %>%
+  mutate(dominant_prop_des = sum(dominant_mention_des)/n()) %>%
+    ungroup
+
+# plot the proportion of dominant word mentioning
+reviewtext %>% ggplot(.,aes(x = dominant_prop_des,
+                         y = overall))+
+  geom_point(alpha=0.2) +
+  geom_smooth(method="lm") +
+  ggtitle("Rating scores vs dominant word mention proportion")
+
+# cor test
+cor.test(as.numeric(reviewtext$overall),
+         reviewtext$dominant_prop_des,
+         method = "pearson")
+# p<0, there is significant positive correlation between the ratings and dominant word mention proportion
+
+# logsitic regression
+domi_m <- polr(overall ~ dominant_prop_des, data = reviewtext, Hess = TRUE)
+summary_table <- coef(summary(domi_m))
+pval <- pnorm(abs(summary_table[, "t value"]),lower.tail = FALSE)* 2
+summary_domi_m <- cbind(summary_table, "p value" = pval)
+```
+
+## evaluate the relationship between the number of categories and ratings
+
+```{r, eval = FALSE}
+# separate the category column
+reviewtext$num_categories <- (str_count(reviewtext$categories,",")+1)
+
+# plot
+  reviewtext %>% ggplot(.,aes(x = num_categories,
+                         y = overall))+
+  geom_point(alpha=0.2) +
+  geom_smooth(method="lm") +
+  ggtitle("Rating scores vs number of categories")
+
+# cor test
+cor.test(as.numeric(reviewtext$overall),
+         reviewtext$num_categories,
+         method = "pearson")
+# There is a negative significant correlation 
+
+# logsitic regression
+num_categories_m <- polr(overall ~ num_categories, data = reviewtext, Hess = TRUE)
+summary_table <- coef(summary(num_categories_m))
+pval <- pnorm(abs(summary_table[, "t value"]),lower.tail = FALSE)* 2
+summary_num_categories_m <- cbind(summary_table, "p value" = pval)
+```
+
+## evaluate the effect of description readability on ratings
+
+```{r, eval = FALSE}
+# calculate the readability of the reviews
+read_des <- qdap::flesch_kincaid(reviewtext$description, reviewtext$review_id)
+
+# merge the readability with the original dataset
+read_des$Readability %>% dplyr::select(review_id,FK_grd.lvl ) -> to_join
+
+reviewtext %>% left_join(to_join) -> reviewtext
+
+reviewtext %>% 
+  dplyr::select(FK_grd.lvl,overall) %>% 
+  na.omit() %>% 
+  ggplot(aes(x=FK_grd.lvl,y=overall))+geom_smooth(method="lm")+geom_point() + ggtitle("Rating scores vs Description Readability")
+
+# logistic regression
+readability_m <- polr(overall ~ FK_grd.lvl, data = reviewtext, Hess = TRUE)
+summary_table <- coef(summary(readability_m))
+pval <- pnorm(abs(summary_table[, "t value"]),lower.tail = FALSE)* 2
+summary_readability_m <- cbind(summary_table, "p value" = pval)
+
+```
+
+# Part B - Sentiment Analysis
+## Home and Kitchen Data Preprocessing For Sentiment Analysis
+
+``` {r Data Preprocessing}
+#Filtering out only English records and relevant columns
+h_and_k_data %>% filter (h_and_k_data$cld2_lang == 'en') %>% select(reviewerID,asin,reviewerName,helpful,reviewText,overall) -> hk_onlyE_sentiment
+
+#Trimming trailing, leading and whitespaces in between in text
+hk_onlyE_sentiment$reviewText <- str_squish(hk_onlyE_sentiment$reviewText)
+
+#Removing URLs from data
+#Regex to remove urls starting with http
+hk_onlyE_sentiment$reviewText <- gsub("http\\S+\\s*", "", hk_onlyE_sentiment$reviewText)
+#Regex to remove urls starting with www
+hk_onlyE_sentiment$reviewText <- gsub("www.\\S+\\.\\S+\\s*", "", hk_onlyE_sentiment$reviewText)
+
+#Removing  numbers from data as they add no significant meaning for text analysis (reviewed with multiple iterations)
+hk_onlyE_sentiment$reviewText <- gsub('[[:digit:]]+', '', hk_onlyE_sentiment$reviewText)
+
+#Removing text between brackets
+hk_onlyE_sentiment$reviewText <- bracketX(hk_onlyE_sentiment$reviewText)
+
+#Replacing contractions 
+hk_onlyE_sentiment$reviewText <- replace_contraction(hk_onlyE_sentiment$reviewText)
+
+#Replacing symbols
+hk_onlyE_sentiment$reviewText <- replace_symbol(hk_onlyE_sentiment$reviewText)
+
+#Replacing word elongations
+hk_onlyE_sentiment$reviewText <- replace_word_elongation(hk_onlyE_sentiment$reviewText, impart.meaning = FALSE)
+
+#Replacing abbreviations
+#Common abbreviations in reviews
+abv <- c("pls", "rofl", "bogo", "fwiw", "asap", "b/c")
+repl <- c("please","rolling on the floor laughing","buy one get one", "for what it is worth", "as soon as possible", "because")
+hk_onlyE_sentiment$reviewText<- replace_abbreviation(hk_onlyE_sentiment$reviewText, abv, repl)
+
+#Replacing emoticons to text 
+hk_onlyE_sentiment$reviewText <- replace_emoticon(hk_onlyE_sentiment$reviewText)
+
+#Removing non ascii characters
+hk_onlyE_sentiment$reviewText <- replace_non_ascii(hk_onlyE_sentiment$reviewText)
+
+#Trimming trailing, leading and whitespaces in between in text
+hk_onlyE_sentiment$reviewText <- str_squish(hk_onlyE_sentiment$reviewText)
+
+#As observed earlier in data preparation, majority of the reviews have a length between 100 characters and 1500 charactes, thus filtering out reviews that don't fall within this range (this is in accordance to amazon guidelines)
+hk_onlyE_sentiment %>% filter(nchar(reviewText) >= 100 & nchar(reviewText) <= 1500) -> hk_onlyE_sentiment
+
+```
+
+##Home and Kitchen Metadata Preprocessing
+
+``` {r Metadata Preprocessing}
+#Merging the metadata with the cleaned data, so as to only preprocess records that are there in the merged dataframe
+hk_onlyE_sentiment <- hk_onlyE_sentiment %>% left_join(h_and_k_metadata, by = "asin")
+
+#Using cld2 to detect language, since it has already been identified to be more accurate previously
+hk_onlyE_sentiment$cld2_lang_title <- cld2::detect_language(hk_onlyE_sentiment$title)
+hk_onlyE_sentiment$cld2_lang_desc <- cld2::detect_language(hk_onlyE_sentiment$description)
+#Identifying rows where language identified for title and description is different
+diff_lang_rows <- which(hk_onlyE_sentiment$cld2_lang_title != hk_onlyE_sentiment$cld2_lang_desc)
+
+#Amongst such rows above, if the language identified for the description is English, then changing the language identified for title to English as well since length of description text is generally larger than length of title
+incorrect_title_lang <- which(hk_onlyE_sentiment$cld2_lang_desc[diff_lang_rows] == 'en') %>% diff_lang_rows[.] 
+hk_onlyE_sentiment[incorrect_title_lang,'cld2_lang_title'] = 'en'
+
+#Filtering for records that have been identified as having English description and title, this is to ensure every review has a corresponding description and title
+hk_onlyE_sentiment <- filter (hk_onlyE_sentiment, cld2_lang_desc == 'en' & cld2_lang_title == 'en')
+
+#Trimming trailing, leading and whitespaces in between in text
+hk_onlyE_sentiment$title <- str_squish(hk_onlyE_sentiment$title)
+hk_onlyE_sentiment$description <- str_squish(hk_onlyE_sentiment$description)
+
+#As observed earlier, majority of the titles have a length between 10 characters and 200 charactes, thus filtering out titles that don't fall within this range (this is in accordance to amazon guidelines)
+hk_onlyE_sentiment %>% filter(nchar(title) >= 10 & nchar(title) <= 200) -> hk_onlyE_sentiment
+
+#As observed earlier, majority of the titles have a length between 30 characters and 2500 charactes, thus filtering out titles that don't fall within this range (this is in accordance to amazon guidelines)
+hk_onlyE_sentiment %>% filter(nchar(description) >= 30 & nchar(description) <= 2500) -> hk_onlyE_sentiment
+
+```
+
+##Tokenization & Custom & Regular Stopwords Removal
+
+``` {r Stopwords Removal}
+#Since emoticons have been converted to text
+hk_onlyE_sentiment$reviewText <- replace_abbreviation(hk_onlyE_sentiment$reviewText, "smiley", "happy")
+
+#Removing stopwords from reviewtext
+hk_onlyE_sentiment$reviewText_clean <- removeWords(hk_onlyE_sentiment$reviewText, c(stop_words$word))
+hk_onlyE_sentiment$reviewText_clean <- str_squish(hk_onlyE_sentiment$reviewText_clean)
+#Saving RDS
+saveRDS(hk_onlyE_sentiment, "hk_data_sentiment_cleaned.RDS")
+
+```
+
+## Handling misspelled words
+
+``` {r Handling Spelling Mistakes}
+sentiment_df <- tibble(line = 1:nrow(hk_onlyE_sentiment), reviewerID = hk_onlyE_sentiment$reviewerID,  text = hk_onlyE_sentiment$reviewText, text_clean = hk_onlyE_sentiment$reviewText_clean)
+
+#Tokenizing reviewtext
+sentiment_df_tokenized <- unnest_tokens(sentiment_df, word, text)
+#Idenitfying unique words in reviewtext
+words_in_data <- unique(sentiment_df_tokenized$word)
+#Checking spelling of words in reviewtext
+misspelled_words <- hunspell(words_in_data)
+#Idenitfying unique misspelled words in reviewtext
+misspelled_words <- unique(unlist(misspelled_words))
+#Suggestions for misspelled words
+suggested_words <- hunspell_suggest(misspelled_words)
+saveRDS(suggested_words, "suggested_words.RDS")
+#Selecting only the top suggested word correction
+suggested_words <- unlist(lapply(suggested_words, function(x) x[1]))
+
+#Saving the misspelled words and corrected word in a dataframe 
+word_corrections_df <- as.data.frame(cbind(misspelled_words, suggested_words))
+#Count frequency of words in reviewtext
+count_df <- count(sentiment_df_tokenized, word)
+count_df <- inner_join(count_df, word_corrections_df, by = c(word = "misspelled_words"))
+
+#Checking suggested word corrections manually, and making those changes in those changes in text
+write.csv(count_df, "word_corrections.csv", row.names = F)
+#Reading corrected words
+corrected_words <- read.xlsx("Correct_Words.xlsx", sheetIndex = 1)                    
+corrected_words$suggested_words <- replace_na(corrected_words$suggested_words, "")
+#Ensuring only the whole word is replaced by adding \b escape character
+corrected_words$word <- paste0("\\b", corrected_words$word, "\\b")
+
+#Replacing misspelled words
+hk_onlyE_sentiment$reviewText <- stri_replace_all_regex(hk_onlyE_sentiment$reviewText, corrected_words$word, corrected_words$suggested_words, vectorize_all = FALSE)
+
+sentiment_df$reviewText <- hk_onlyE_sentiment$reviewText
+sentiment_df$text_clean <- stri_replace_all_regex(sentiment_df$text_clean, corrected_words$word, corrected_words$suggested_words, vectorize_all = FALSE)
+sentiment_df$text_clean <- str_squish(sentiment_df$text_clean)
+sentiment_df$reviewText <- str_squish(sentiment_df$reviewText)
+
+saveRDS(sentiment_df, "sentiment_df.RDS")
+
+```
+
+## Sampling the data
+
+```{r Sampling Data}
+#Getting rating column
+sentiment_df$rating <- hk_onlyE_sentiment$overall
+
+#Plotting the distribution of rating
+rating_distribution <- ggplot(sentiment_df) + geom_histogram(aes(rating), binwidth=1) + labs(x="Rating", y="Frequency", title = "Frequency Distribution of Rating")
+
+( prop.table(table(sentiment_df$rating)) )
+#It can be observed that the data is highly imbalanced, the proportion of of satisfied customers that have given a rating of 4 and almost take up 85% of the total distribution of ratings.
+
+#Adding a column for customer type
+sentiment_df$custype <- "dissatisfied"
+#Customers that have given a rating of 4 and above are considered satisfied, whereas customers with rating 3 and below are considered dissatisfied
+sentiment_df$custype[which(sentiment_df$rating == 4 | sentiment_df$rating == 5)] = "satisfied"
+#Converting the customer type column to a factor of 2 levels - satisfied & disatisfied
+sentiment_df['custype'] <- lapply(sentiment_df['custype'], as.factor)
+( prop.table(table(sentiment_df$custype)) )
+
+#For sentiment analysis, the data is being balanced to see the effect of sentiment scores on high and low ratings and to ensure that the regression models executed aren't overly skewed towards high ratings
+#Since proprotion of high ratings was a lot higher than lower ratings in the dataset, balancing the dataset into a 60-40 ratio of high to lower ratings
+#Using under and over sampling to prevent loss of data
+sampled_sentiment_df <- ovun.sample(custype ~ ., data = sentiment_df , method = "both", p=0.6, seed=1)$data
+( prop.table(table(sampled_sentiment_df$custype)) )
+( prop.table(table(sampled_sentiment_df$rating)) )
+
+#Sentiment analysis will be conducted on the sampled dataset
+
+#Adding rownumbers in sample df
+sampled_sentiment_df$row_num <- 1:nrow(sampled_sentiment_df) 
+#Counting words in each row of sample df
+sampled_sentiment_df$count_of_words <- unnest_tokens(sampled_sentiment_df,word,text_clean) %>% group_by(row_num) %>% summarise(count_of_words = n()) %>% .$count_of_words
+
+```
+
+## Normalized Dictionary Coverage and Sentiment Score Calculation
+
+``` {r Normalized Sentiment Score Calculation}
+#Getting required dictionaries
+# bing
+bing_dictionary <- get_sentiments("bing") 
+# Afinn
+afinn_dictionary <- get_sentiments("afinn") 
+# Loughran Dictionary
+lm_dictionary <- get_sentiments("loughran") 
+# NRC dictionary (feelings)
+nrc_dictionary <- get_sentiments("nrc")
+
+#Sentiment analysis will be conducted on the sampled dataset
+#Adding rownumbers in sample df
+sampled_sentiment_df$row_num <- 1:nrow(sampled_sentiment_df) 
+#Counting words in each row of sample df
+sampled_sentiment_df$count_of_words <- unnest_tokens(sampled_sentiment_df,word,text_clean) %>% group_by(row_num) %>% summarise(count_of_words = n()) %>% .$count_of_words
+
+#Normalized Bing Sentiment Score
+#Counting words in each row that are present in bing dictionary
+sampled_sentiment_df$match_count <- unnest_tokens(sampled_sentiment_df, word, text_clean) %>% left_join(bing_dictionary) %>% group_by(row_num) %>% summarise(match_c = sum(!is.na(sentiment))) %>% .$match_c
+#Adding counts of positive and negative words in each row in temporary df
+temp_df <- unnest_tokens(sampled_sentiment_df, word, text_clean) %>% left_join(bing_dictionary) %>% count(row_num,sentiment,count_of_words,match_count) %>% pivot_wider(names_from = sentiment,values_from = n)
+temp_df[is.na(temp_df)] <- 0
+#Calculating normalized sentiment based on dictionary coverage
+temp_df <- temp_df %>% mutate(bing_sentiment = ((positive-negative)/(positive+negative)) * (match_count/count_of_words))
+temp_df[is.na(temp_df)] <- 0
+#Removing unecessary columns
+temp_df$count_of_words <- NULL
+temp_df$match_count <- NULL
+temp_df$negative <- NULL
+temp_df$'NA' <- NULL
+temp_df$positive <- NULL
+#Merging bing_sentiment with sampled data
+sampled_sentiment_df <- sampled_sentiment_df %>% left_join(temp_df, by = "row_num")
+sampled_sentiment_df$match_count <- NULL
+
+#Normalized Loughran Sentiment Score
+#Counting words in each row that are present in loughran dictionary
+sampled_sentiment_df$match_count <- unnest_tokens(sampled_sentiment_df, word, text_clean) %>% left_join(lm_dictionary) %>% group_by(row_num) %>% summarise(match_c = sum(!is.na(sentiment))) %>% .$match_c
+#Adding counts of positive and negative words in each row in temporary df
+temp_df <- unnest_tokens(sampled_sentiment_df, word, text_clean) %>% left_join(lm_dictionary) %>% count(row_num,sentiment,count_of_words,match_count) %>% pivot_wider(names_from = sentiment,values_from = n)
+temp_df[is.na(temp_df)] <- 0
+#Calculating normalized sentiment based on dictionary coverage
+temp_df <- temp_df %>% mutate(nrc_sentiment = ((positive-negative)/(positive+negative)) * (match_count/count_of_words))
+temp_df[is.na(temp_df)] <- 0
+#Removing unecessary columns
+temp_df$count_of_words <- NULL
+temp_df$match_count <- NULL
+temp_df$negative <- NULL
+temp_df$'NA' <- NULL
+temp_df$positive <- NULL
+temp_df$uncertainty <- NULL
+temp_df$constraining <- NULL
+temp_df$litigious <- NULL
+temp_df$superfluous <- NULL
+#Merging bing_sentiment with sampled data
+sampled_sentiment_df <- sampled_sentiment_df %>% left_join(temp_df, by = "row_num")
+sampled_sentiment_df$match_count <- NULL
+
+#Normalized NRC Sentiment Score
+#Counting words in each row that are present in nrc dictionary
+sampled_sentiment_df$match_count <- unnest_tokens(sampled_sentiment_df, word, text_clean) %>% left_join(nrc_dictionary) %>% group_by(row_num) %>% summarise(match_c = sum(!is.na(sentiment))) %>% .$match_c
+#Adding counts of positive and negative words in each row in temporary df
+temp_df <- unnest_tokens(sampled_sentiment_df, word, text_clean) %>% left_join(nrc_dictionary) %>% count(row_num,sentiment,count_of_words,match_count) %>% pivot_wider(names_from = sentiment,values_from = n)
+temp_df[is.na(temp_df)] <- 0
+#Calculating normalized sentiment based on dictionary coverage
+temp_df <- temp_df %>% mutate(nrc_sentiment = ((positive-negative)/(positive+negative)) * (match_count/count_of_words))
+temp_df[is.na(temp_df)] <- 0
+#Removing unecessary columns
+temp_df$count_of_words <- NULL
+temp_df$match_count <- NULL
+temp_df$negative <- NULL
+temp_df$'NA' <- NULL
+temp_df$positive <- NULL
+temp_df$anger <- NULL
+temp_df$anticipation <- NULL
+temp_df$disgust <- NULL
+temp_df$fear <- NULL
+temp_df$joy <- NULL
+temp_df$sadness <- NULL
+temp_df$surprise <- NULL
+temp_df$trust <- NULL
+#Merging bing_sentiment with sampled data
+sampled_sentiment_df <- sampled_sentiment_df %>% left_join(temp_df, by = "row_num")
+sampled_sentiment_df$match_count <- NULL
+
+#Normalized AFINN Sentiment Score
+#Counting words in each row that are present in loughran dictionary
+sampled_sentiment_df$match_count <- unnest_tokens(sampled_sentiment_df, word, text_clean) %>% left_join(afinn_dictionary) %>% group_by(row_num) %>% summarise(match_c = sum(!is.na(value))) %>% .$match_c
+#Adding counts of positive and negative words in each row in temporary df
+temp_df <- unnest_tokens(sampled_sentiment_df, word, text_clean) %>% left_join(afinn_dictionary)
+temp_df[is.na(temp_df)] <- 0
+temp_df <- temp_df %>% group_by(row_num, match_count, count_of_words) %>% summarise(afinn_sentiment = sum(value))
+#Calculating normalized sentiment based on dictionary coverage
+temp_df$afinn_sentiment <- temp_df$afinn_sentiment *(temp_df$match_count/temp_df$count_of_words)
+#Removing unecessary columns
+temp_df$count_of_words <- NULL
+temp_df$match_count <- NULL
+#Merging bing_sentiment with sampled data
+sampled_sentiment_df <- sampled_sentiment_df %>% left_join(temp_df, by = "row_num")
+sampled_sentiment_df$match_count <- NULL
+
+```
+
+## Evaluating various dictionaries through visualization
+
+``` {r Dictionary evaluation}
+str(sampled_sentiment_df)
+#Converting rating column to an ordinal variable
+sampled_sentiment_df$rating <- factor(sampled_sentiment_df$rating, order = TRUE, levels = c(1,2,3,4,5))
+
+#Comparing the differences in the dictionaries
+afinn <- sampled_sentiment_df
+afinn$line <- NULL
+afinn$reviewerID <- NULL
+afinn$text_clean <- NULL
+afinn$reviewText <- NULL
+afinn$count_of_words <- NULL
+afinn$bing_sentiment <- NULL
+afinn$nrc_sentiment <- NULL
+afinn$loughran_sentiment <- NULL
+afinn$afinn_sentiment <- NULL
+afinn$sentiment <- sampled_sentiment_df$afinn_sentiment
+afinn$method <- "AFINN"
+
+bing <- sampled_sentiment_df
+bing$line <- NULL
+bing$reviewerID <- NULL
+bing$text_clean <- NULL
+bing$reviewText <- NULL
+bing$count_of_words <- NULL
+bing$afinn_sentiment <- NULL
+bing$nrc_sentiment <- NULL
+bing$loughran_sentiment <- NULL
+bing$bing_sentiment <- NULL
+bing$sentiment <- sampled_sentiment_df$bing_sentiment
+bing$method <- "Bing"
+
+lm <- sampled_sentiment_df
+lm$line <- NULL
+lm$reviewerID <- NULL
+lm$text_clean <- NULL
+lm$reviewText <- NULL
+lm$count_of_words <- NULL
+lm$afinn_sentiment <- NULL
+lm$nrc_sentiment <- NULL
+lm$bing_sentiment <- NULL
+lm$loughran_sentiment <- NULL
+lm$sentiment <- sampled_sentiment_df$loughran_sentiment
+lm$method <- "Loughran"
+
+nrc <- sampled_sentiment_df
+nrc$line <- NULL
+nrc$reviewerID <- NULL
+nrc$text_clean <- NULL
+nrc$reviewText <- NULL
+nrc$count_of_words <- NULL
+nrc$afinn_sentiment <- NULL
+nrc$loughran_sentiment <- NULL
+nrc$bing_sentiment <- NULL
+nrc$nrc_sentiment <- NULL
+nrc$sentiment <- sampled_sentiment_df$nrc_sentiment
+nrc$method <- "NRC"
+rm(nrc_sentiment, calc_norm_sentiment)
+
+#Plot 1 - the sentiment in each dictionary
+all_sent_plot <- bind_rows(afinn,bing, nrc, lm) %>% ggplot(aes(row_num, sentiment, fill = method)) + geom_col(show.legend = FALSE) + facet_wrap(~method, ncol = 1, scales = "free_y") + labs(x = "Index", y= "Sentiment", title = "Comparison of Sentiment by Dictionary")
+
+# Plot2 -  the sentiment in each dictionary
+bing_sent <- sampled_sentiment_df %>%
+  mutate(index = row_number(), sign = sign(bing_sentiment)) %>%
+  ggplot(aes(x=index,y=bing_sentiment, fill = sign))+
+  geom_bar(stat="identity")
+nrc_sent <- sampled_sentiment_df %>%
+  mutate(index = row_number(), sign = sign(nrc_sentiment)) %>%
+  ggplot(aes(x=index,y=nrc_sentiment, fill = sign))+
+  geom_bar(stat="identity")
+afinn_sent <- sampled_sentiment_df %>%
+  mutate(index = row_number(), sign = sign(afinn_sentiment)) %>%
+  ggplot(aes(x=index,y=afinn_sentiment, fill = sign))+
+  geom_bar(stat="identity")
+lm_sent <- sampled_sentiment_df %>%
+  mutate(index = row_number(), sign = sign(loughran_sentiment)) %>%
+  ggplot(aes(x=index,y=loughran_sentiment, fill = sign))+
+  geom_bar(stat="identity")
+sent_each_plot <- ggarrange(bing_sent,nrc_sent,afinn_sent,lm_sent,common.legend = TRUE, legend = "bottom")
+annotate_figure(sent_each_plot, top = text_grob("Signwise Comparison of Sentiment by Dictionary",  size = 14))
+```
+
+##Affection categorization
+
+``` {r Evaluating dictionaries through regression}
+#Ordered logistic regression for each sentiment score
+bing_model <- polr(sampled_sentiment_df$rating~sampled_sentiment_df$bing_sentiment, Hess = TRUE)
+summary_table <- coef(summary(bing_model))
+pval <- pnorm(abs(summary_table[, "t value"]),lower.tail = FALSE)* 2
+summary_bing <- cbind(summary_table, "p value" = pval)
+pR2(bing_model)
+#Pseudo Rsquare - 0.07, AIC - 993536
+
+afinn_model <- polr(sampled_sentiment_df$rating~sampled_sentiment_df$afinn_sentiment, Hess = TRUE)
+summary_table <- coef(summary(afinn_model))
+pval <- pnorm(abs(summary_table[, "t value"]),lower.tail = FALSE)* 2
+summary_afinn <- cbind(summary_table, "p value" = pval)
+pR2(afinn_model)
+#Pseudo Rsquare - 0.04, AIC - 1020746
+
+lm_model <- polr(sampled_sentiment_df$rating~sampled_sentiment_df$loughran_sentiment, Hess = TRUE)
+summary_table <- coef(summary(lm_model))
+pval <- pnorm(abs(summary_table[, "t value"]),lower.tail = FALSE)* 2
+summary_lm <- cbind(summary_table, "p value" = pval)
+pR2(lm_model)
+#Pseudo Rsquare - 0.05 , AIC - 1018692
+
+nrc_model <- polr(sampled_sentiment_df$rating~sampled_sentiment_df$nrc_sentiment, Hess = TRUE)
+summary_table <- coef(summary(nrc_model))
+pval <- pnorm(abs(summary_table[, "t value"]),lower.tail = FALSE)* 2
+summary_nrc <- cbind(summary_table, "p value" = pval)
+pR2(nrc_model)
+#Pseudo Rsquare - 0.02 , AIC - 1043350
+
+stargazer(bing_model,afinn_model,lm_model,nrc_model, type = "text")
+#All models have significant regression coefficients, however since the AIC value is the lowest and Pseudo Rsquare value is the highest for the the bing model it seems to be the most appropriate for sentiment calculation - however we can be more sure by using IG for each sentiment score 
+
+#Information Gain - to identify best dictionary for sentiment analysis
+ig_attributes <- information.gain(rating ~., sampled_sentiment_df)
+ig_attributes <- data.frame(attribute = c("bing", "loughran", "nrc", "afinn"), attribute_importance = c(0.12273341,0.092084017,0.04977959, 0.094138262) )    
+
+barplot(ig_attributes$attribute_importance,
+main = "Information Gain for Each Sentiment Score",
+xlab = "Attributes",
+ylab = "Attributes Importance",
+names.arg = ig_attributes$attribute,
+col = "darkred",
+horiz = TRUE)
+
+#Plotting the dictionary sentiment regression models
+plot_bing_model = sampled_sentiment_df %>%ggplot(aes(x=bing_sentiment,y= rating))  + geom_smooth(method="lm") + geom_point(size = 2, shape=1,alpha=0.1) + labs(x = "Bing Sentiment Score", y = "Rating", title = "Bing Sentiment vs Rating")
+
+plot_lm_model = sampled_sentiment_df %>% ggplot(aes(x=loughran_sentiment,y=rating))  + geom_smooth(method="lm") + geom_point(size = 2, shape=1,alpha=0.1) + labs(x = "Loughran Sentiment Score", y = "Rating", title = "Loughran Sentiment vs Rating")
+
+plot_nrc_model= sampled_sentiment_df %>% ggplot(aes(x=nrc_sentiment,y= rating))  + geom_smooth(method="lm") + geom_point(size = 2, shape=1,alpha=0.1) + labs(x = "NRC Sentiment Score", y = "Rating", title = "NRC Sentiment vs Rating")
+
+plot_afinn_model = sampled_sentiment_df %>% ggplot(aes(x=afinn_sentiment,y=rating))  + geom_smooth(method="lm") + geom_point(size = 2, shape=1,alpha=0.1)+ labs(x = "Afinn Sentiment Score", y = "Rating", title = "Afinn Sentiment vs Rating")
+
+all_dict_reg_plots <- ggarrange(plot_bing_model, plot_lm_model, plot_nrc_model, plot_afinn_model, ncol = 2, nrow = 2)
+annotate_figure(all_dict_reg_plots, top = text_grob("Dictionary Sentiment Regression Models",  size = 14))
+
+#Since bing dictionary has been identified as the most appropriate dictionary, plotting sentiment metrics for bing dictonary 
+
+bing_sent_by_rating <- ggplot(sampled_sentiment_df, aes(row_num, bing_sentiment, fill = rating)) + geom_col(show.legend = FALSE) + facet_wrap(~rating, ncol = 2, scales = "free_x") + labs(x = "Index", y = "Bing Sentiment Score", title = "Bing Sentiment Score By Rating Category")
+
+#Top words that contribute to bing sentiment in the sample data
+sent_word_counts <- sampled_sentiment_df %>% unnest_tokens(word,text_clean) %>% 
+  inner_join(bing_dictionary) %>%
+  count(word, sentiment, sort = TRUE) %>%
+  ungroup()
+
+sent_word_counts %>%
+  group_by(sentiment) %>%
+  slice_max(n, n = 10) %>% 
+  ungroup() %>%
+  mutate(word = reorder(word, n)) %>%
+  ggplot(aes(n, word, fill = sentiment)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~sentiment, scales = "free_y") +
+  labs(x = "Contribution to sentiment", y = NULL, title = "Dominant Words Contributing to Bing Sentiment")
+
+#Extracting feelings from the sample data 
+nrc_result <- sampled_sentiment_df %>% 
+    unnest_tokens(word, text_clean) %>% 
+    inner_join(nrc_dictionary) %>% 
+    count(row_num,sentiment) %>% 
+    pivot_wider(names_from=sentiment, values_from=n) %>% 
+    mutate(sentiment = (positive - negative)/(positive+negative)) %>% 
+    mutate(dictionary = "nrc")
+
+nrc_result %>% 
+  pivot_longer(anger:sentiment,names_to = "feeling",values_to="sentiment") %>% 
+  ggplot(aes(x=row_num,y=sentiment,fill=feeling))+
+  geom_smooth()+
+  facet_wrap(~feeling,scales="free_y",ncol=2)  + labs(x = "Index", y = "Score", title = "Score by Feelings Categorization")
+
+sampled_sentiment_df %>% dplyr::select(row_num,bing_sentiment) -> to_join
+nrc_result %>% left_join(to_join, by = "row_num") -> nrc_result
+
+#Correlation of feelings with bing sentiment since bing dictionary was recognized as most suitable for sentiment analysis
+to_corr2 <- nrc_result %>% 
+  dplyr::select(-c(positive,negative,dictionary,rating,sentiment)) %>% 
+  dplyr::select(anger:bing_sentiment) 
+
+knitr::kable(round(cor(na.omit(to_corr2)),2))
+corrplot::corrplot(cor(na.omit(to_corr2)))
+#As can be observed by the above correlation plots, none of the feelings are significantly correlated with the bing sentiment score, however some minor correlations do exist. Since bing sentiment score has an effect on rating,  running multiple logistic regression on ratings to check the effects of feelings on rating 
+
+feelings_model <- polr(nrc_result$rating~nrc_result$anger+nrc_result$anticipation+nrc_result$disgust+nrc_result$fear+nrc_result$joy+nrc_result$sadness+nrc_result$surprise+nrc_result$trust, Hess = TRUE)
+summary_table <- coef(summary(feelings_model))
+pval <- pnorm(abs(summary_table[, "t value"]),lower.tail = FALSE)* 2
+summary_feelings <- cbind(summary_table, "p value" = pval)
+
+#Running the bing sentiment regression model on the same dataset
+stargazer(feelings_model, type = 'text')
+pR2(feelings_model)
+#Pseudo Rsquare score of 0.9, which shows that the model has significant predictive power in assessing rating. 
+
+```
+
+##Syntactical Features
+
+``` {r Syntactical Features}
+#Extracting syntactical features such as the effect of exclamation marks and their proportion in the length of review of text 
+sampled_sentiment_df <- sampled_sentiment_df %>%
+  mutate(ex_count = str_count(reviewText, "!")) %>%
+  group_by(row_num) %>%
+  mutate(total_ex_count = sum(ex_count),
+         ex_prop = total_ex_count/nchar(reviewText))
+
+#Running regression models to check the effect of the above features on rating
+#Model for exclamation mark proportion
+ex_prop_model <- polr(rating~ex_prop, data=sampled_sentiment_df, Hess = TRUE)
+summary_table <- coef(summary(ex_prop_model))
+pval <- pnorm(abs(summary_table[, "t value"]),lower.tail = FALSE)* 2
+summary_ex_prop_model <- cbind(summary_table, "p value" = pval)
+pR2(ex_prop_model)
+#Pseudo Rsquare value of 0.0037, which shows the model has low predictive power. AIC - 1069333.65
+
+#Model for total exclamation count 
+ex_count_model <- polr(rating~total_ex_count, data = sampled_sentiment_df, Hess = TRUE)
+summary_table <- coef(summary(ex_count_model))
+pval <- pnorm(abs(summary_table[, "t value"]),lower.tail = FALSE)* 2
+summary_ex_count_model <- cbind(summary_table, "p value" = pval)
+pR2(ex_count_model)
+#Pseudo Rsquare value of 0.00077, indicating the model has low predictive power.AIC - 1072284.30 
+#Both coeffecients are siginificant. Exclamation proportion being a better predictor due to lower AIC score and higher Pseudo Rsquare value. 
+
+#Extracting capital letters and their proportion in reviewtext 
+sampled_sentiment_df <- sampled_sentiment_df %>%
+  mutate(cap_count = str_count(reviewText, "[[:upper:]]")) %>%
+  group_by(row_num) %>%
+  mutate(total_cap_count = sum(cap_count),
+         cap_prop = total_cap_count/nchar(reviewText)) 
+
+#Running regression models to check the effect of the above features on rating
+#Model for capital letters  proportion
+cap_prop_model <- polr(rating~cap_prop, data=sampled_sentiment_df, Hess = TRUE)
+summary_table <- coef(summary(cap_prop_model))
+pval <- pnorm(abs(summary_table[, "t value"]),lower.tail = FALSE)* 2
+summary_cap_prop_model <- cbind(summary_table, "p value" = pval)
+pR2(cap_prop_model)
+#Pseudo RSquare - 0.00011, indicating low preditive power. AIC - 1072929.92
+
+#Model for total capital letters count
+cap_count_model <- polr(rating~total_cap_count, data = sampled_sentiment_df, Hess = TRUE)
+summary_table <- coef(summary(cap_count_model))
+pval <- pnorm(abs(summary_table[, "t value"]),lower.tail = FALSE)* 2
+summary_cap_count_model <- cbind(summary_table, "p value" = pval)
+pR2(cap_count_model)
+#Pseudo Rsquare - 0.002, indicating low predictive power, AIC - 1070705.06
+#Both coefficients are significant. However Capital letters count is the better predictor due to higher Rsquare value and lower AIC. 
+
+#Plotting the syntactical features regression models
+plot_ex_model = sampled_sentiment_df %>%ggplot(aes(x=ex_prop,y= rating))  + geom_smooth(method="lm") + geom_point(size = 2, shape=1,alpha=0.1) + labs(x = "Exclamation Marks Proportion", y = "Rating", title = "Exclamation Marks Proportion vs Rating")
+
+plot_ex_count_model = sampled_sentiment_df %>% ggplot(aes(x=total_ex_count,y=rating))  + geom_smooth(method="lm") + geom_point(size = 2, shape=1,alpha=0.1) + labs(x = "Exclamation Marks Count", y = "Rating", title = "Total Exclamation Marks Count vs Rating")
+
+plot_cap_model= sampled_sentiment_df %>% ggplot(aes(x=cap_prop,y= rating))  + geom_smooth(method="lm") + geom_point(size = 2, shape=1,alpha=0.1) + labs(x = "Capital Letter Proportion", y = "Rating", title = "Capital Letters Proportion vs Rating")
+
+plot_cap_count_model = sampled_sentiment_df %>% ggplot(aes(x=total_cap_count,y=rating))  + geom_smooth(method="lm") + geom_point(size = 2, shape=1,alpha=0.1)+ labs(x = "Capital Letters Count", y = "Rating", title = "Total Capital Letters Count vs Rating")
+
+all_syn_reg_plots <- ggarrange(plot_ex_model, plot_ex_count_model, plot_cap_model, plot_cap_count_model, ncol = 2, nrow = 2)
+annotate_figure(all_syn_reg_plots, top = text_grob("Syntactical Features Regression Models",  size = 14))
+
+#Checking readability and it's effect on rating
+read_listing <- flesch_kincaid(sampled_sentiment_df$reviewText,sampled_sentiment_df$row_num)
+read_listing$Readability %>% dplyr::select(row_num,FK_grd.lvl) -> to_join
+#Adding readibility value to the original dataset
+sampled_sentiment_df %>% left_join(to_join, by = "row_num") -> sampled_sentiment_df
+
+#Regression model for readibility and rating
+read_model <- polr(rating~FK_grd.lvl, data=sampled_sentiment_df, Hess = TRUE)
+summary_table <- coef(summary(read_model))
+pval <- pnorm(abs(summary_table[, "t value"]),lower.tail = FALSE)* 2
+summary_read_model <- cbind(summary_table, "p value" = pval)
+pR2(read_model)
+#Pseudo Rsquare value of 0.0044, AIC - 1068331.70
+
+#Plotting the relationship between readibility and rating
+sampled_sentiment_df %>% 
+  dplyr::select(FK_grd.lvl,rating) %>% 
+  distinct() %>% 
+  na.omit() %>% 
+  filter(FK_grd.lvl>30) %>%  
+  ggplot(aes(x=FK_grd.lvl,y=rating))+geom_smooth(method="lm")+geom_point() + labs(x = "Readibility Value", y = "Rating", title = "Relationship B/W Readibility & Rating")
+
+stargazer::stargazer(ex_prop_model,ex_count_model,cap_prop_model,cap_count_model,read_model, type = "text")
+```
+
+## Handling text negations and modifiers
+
+```{r Handling text negations and modifiers}
+#Using sentimentr package to calculate sentiment which is better at handling negations and modifiers
+
+sampled_sentiment_df2 = sentiment_by(get_sentences(sampled_sentiment_df$reviewText))
+sampled_sentiment_df2 %>% dplyr::select(element_id,ave_sentiment) -> to_join
+#Adding readibility value to the original dataset
+sampled_sentiment_df %>% left_join(to_join, by = c("row_num" = "element_id")) -> sampled_sentiment_df
+
+#Checking the relationship between ratings and sentimentr calculated sentiment
+sentimentr_model <- polr(rating~ave_sentiment, data=sampled_sentiment_df, Hess = TRUE)
+summary_table <- coef(summary(sentimentr_model))
+pval <- pnorm(abs(summary_table[, "t value"]),lower.tail = FALSE)* 2
+summary_sentimentr_model <- cbind(summary_table, "p value" = pval)
+
+#Assuming the bing sentiment model to be the baseline model, comparing that baseline with the sentimentr model to check which is better
+anova(bing_model, sentimentr_model)
+#The sentimentr model fits significantly better in predicitng rating when compared to the bing sentiment model
+
+```
+
+# Part C - Topic Modelling and Latent Dirichlet allocation
+
+```{r}
+# load the data
+cleandata <- read.csv("Cleaned_H&K_Data_updated copy.csv")
+
+#normalizing the data
+cleandata$review_id <- 1:nrow(cleandata)
+
+# Cleaning up the language
+# For some computers the character set is not 
+# automatically set to latin or ASCII
+cleandata$reviewText <- iconv(cleandata$reviewText)
+
+
+```
+
+```{r}
+#Foicus on the columns needed
+reviewtext <- cleandata %>% 
+  select(review_id,reviewText,overall)  
+
+```
+
+```{r}
+# Part of Speech Tagging (POS)
+#Setup the udpipe process
+#first download the model for the english language 
+langmodel_download <- udpipe::udpipe_download_model("english")
+
+
+#lets now load it 
+# langmodel <- udpipe::udpipe_load_model(langmodel_download$file_model)
+langmodel <- udpipe::udpipe_load_model("english-ewt-ud-2.5-191206.udpipe")
+
+```
+
+```{r}
+annotated_reviews_all <- data.frame()
+
+# Set to larger for a faster 
+# computer - or follow my file based 
+# parallelization 
+# split the data into groups, each having 1000 observations
+# POS tagging, identify NOUN, ADJ,ADV
+split_size <- 1000
+
+for_pos_list <- split(reviewtext, 
+                     rep(1:ceiling(nrow(reviewtext)
+                                   /split_size), 
+                         each=split_size,
+                         length.out=nrow(reviewtext)))
+
+
+
+for(i in 1:length(for_pos_list)){
+    udpipe_annotate(for_pos_list[[i]]$reviewText,
+                doc_id = for_pos_list[[i]]$review_id,
+                object = langmodel) %>% 
+    as.data.frame() %>% 
+    filter(upos %in% c("NOUN","ADJ","ADV")) %>%
+    select(doc_id,lemma) %>% 
+    group_by(doc_id) %>% 
+    summarise(annotated_comments = paste(lemma, collapse = " ")) %>% 
+    rename(review_id = doc_id) -> this_annotated_reviews
+  
+  print(paste(i,"from",length(for_pos_list)))
+  annotated_reviews_all <- bind_rows(annotated_reviews_all,
+                                     this_annotated_reviews)
+}
+```
+
+```{r cleaning}
+#Join the data back to the original data
+annotated_reviews_all$review_id <- as.integer(annotated_reviews_all$review_id)
+reviewtext <- annotated_reviews_all %>%
+  left_join(reviewtext)
+saveRDS(annotated_reviews_all,"annotated_reviews_all.RDS")
+
+#sampling the data
+library(ROSE)
+#Segregating data into satisfied and dissatisfied customers
+reviewtext$custype <- "dissatisfied"
+reviewtext$custype[which(reviewtext$overall == 4 | reviewtext$overall == 5)] = "satisfied"
+#Factoring customer type column
+reviewtext['custype'] <- lapply(reviewtext['custype'], as.factor)
+( prop.table(table(reviewtext$custype)))
+#Sampling the data using both over and under sampling to prevent loss of data
+sampled_reviewtext <- ovun.sample(custype ~., data= reviewtext, method = "both", p=0.6, seed=1)$data
+( prop.table(table(sampled_reviewtext$custype)))
+
+```
+
+```{r}
+satisfied <- sampled_reviewtext %>%
+  filter (custype == "satisfied")
+unsatisfied <- sampled_reviewtext %>%
+  filter (custype == "dissatisfied")
+```
+
+```{r}
+#The STM package comes with out-of-the box functionality for pre-processing the text in its raw form including some basic stemming
+text1 <- textProcessor(satisfied$annotated_comments,
+                           metadata = satisfied,
+                           removestopwords = TRUE,
+                       stem = F) #satisfied group
+
+text2 <-textProcessor(unsatisfied$annotated_comments,
+                           metadata = unsatisfied,
+                           removestopwords = TRUE,
+                      stem = F) 
+
+```
+
+```{r}
+# keep those words who appear more than 1% in the document corpus
+threshold_sa <- round(1/100 * length(text1$documents),0)
+out_sa <- prepDocuments(text1$documents,
+text1$vocab,
+text1$meta,
+lower.thresh = threshold_sa)
+
+threshold_unsa <- round(1/100 * length(text2$documents),0)
+out_unsa <- prepDocuments(text2$documents,
+text2$vocab,
+text2$meta,
+lower.thresh = threshold_sa)
+```
+
+```{r}
+library(geometry)
+library(Rtsne)
+library(rsvd)
+fit_sa0 <- stm(documents = out_sa$documents,
+vocab = out_sa$vocab,
+K = 0,
+prevalence =~ overall,
+max.em.its = 75,
+data = out_sa$meta,
+reportevery=10,
+# gamma.prior = "L1",
+sigma.prior = 0.7,
+init.type = "Spectral") #satisfied group
+saveRDS(fit_sa0, "fit_sa0.RDS")
+
+fit_unsa0 <- stm(documents = out_unsa$documents,
+vocab = out_unsa$vocab,
+K = 0,
+prevalence =~ overall,
+max.em.its = 75,
+data = out_unsa$meta,
+reportevery=10,
+# gamma.prior = "L1",
+sigma.prior = 0.7,
+init.type = "Spectral") #unsatisfied group
+saveRDS(fit_unsa0, "fit_unsa0.RDS")
+
+```
+```{r}
+# having 30 topics totally,setting the range from 6 to 10, repeat the process by adjusting the k to prove
+numtopics_sa <- searchK(out_sa$documents,out_sa$vocab,K=seq(from=6, to=10,by=1)) #satisfied group
+
+# having 38 topics totally,setting the range from 8 to 10, repeat the process by adjusting the k to prove
+numtopics_unsa <- searchK(out_unsa$documents,out_unsa$vocab,K=seq(from=8, to=10,by=1)) #unsatisfied group
+
+# plot for satisfied group
+plot(numtopics_sa)
+# the optinimal number of the topic should be 11
+# plot for unsatisfied group
+plot(numtopics_unsa)
+# the optinimal number of the topic should be 14
+saveRDS(numtopics_sa, "numtopics_sa.RDS")
+saveRDS(numtopics_unsa, "numtopics_unsa.RDS")
+```
+
+```{r}
+# having ten as the optimal number, repeat the process by adjusting the k to prove
+numtopics_sa1 <- searchK(out_sa$documents,out_sa$vocab,K=seq(from=8, to=12,by=1)) #satisfied group
+
+# having nine as the optimal number, repeat the process by adjusting the k to prove
+numtopics_unsa1 <- searchK(out_unsa$documents,out_unsa$vocab,K=seq(from=9, to=14,by=1)) #unsatisfied group
+
+# plot for satisfied group
+plot(numtopics_sa1)
+# the optinimal number of the topic should be 10
+# plot for unsatisfied group
+plot(numtopics_unsa1)
+# the optinimal number of the topic should be 14
+saveRDS(numtopics_sa1, "numtopics_sa1.RDS")
+saveRDS(numtopics_unsa1, "numtopics_unsa1.RDS")
+```
+
+```{r}
+#stm
+fit_sa <- stm(documents = out_sa$documents,
+vocab = out_sa$vocab,
+K = 10,
+prevalence =~ overall,
+max.em.its = 75,
+data = out_sa$meta,
+reportevery=10,
+# gamma.prior = "L1",
+sigma.prior = 0.7,
+init.type = "Spectral") #satisfied group
+saveRDS(fit_sa, "fit_sa.RDS")
+fits_sa = readRDS("fit_sa.RDS")
+fit_unsa <- stm(documents = out_unsa$documents,
+vocab = out_unsa$vocab,
+K = 14,
+prevalence =~ overall,
+max.em.its = 75,
+data = out_unsa$meta,
+reportevery=10,
+# gamma.prior = "L1",
+sigma.prior = 0.7,
+init.type = "Spectral") #unsatisfied group
+saveRDS(fit_unsa, "fit_unsa.RDS")
+fits_unsa =readRDS("fit_unsa.RDS")
+
+```
+
+```{r}
+# plot the stm object to see the percentage ot the topics in the corpus
+summary(fits_sa) #satisfied group
+plot(fits_sa) #satisfied group
+summary(fits_unsa) #unsatisfied group
+plot(fits_unsa) #unsatisfied group
+```
+
+```{r}
+fit_topics_sa<-tidy(fits_sa,matrix="beta") #satisfied group
+# get the top 10 terms:
+fit_terms_sa<-fit_topics_sa %>%
+  group_by(topic) %>%
+  slice_max(beta,n=10) %>%
+  ungroup() %>%
+  arrange(topic,desc(beta)) #satisfied group
+
+fit_topics_unsa<-tidy(fits_unsa,matrix="beta") #unsatisfied group
+# get the top 10 terms:
+fit_terms_unsa<-fit_topics_unsa %>%
+  group_by(topic) %>%
+  slice_max(beta,n=10) %>%
+  ungroup() %>%
+  arrange(topic,desc(beta)) #unsatisfied group
+
+```
+
+```{r}
+#topic labeling
+topic_labels_sa <- c("pans","cost_effective","knives","kitchen_storage","Glass_jars","coffee_machine","domestic_appliances","beddings","shelf_space","cooking")
+fit_terms_sa <- fit_terms_sa %>% 
+  mutate (labels = case_when((topic == 1)~topic_labels_sa[1],
+          (topic == 2)~topic_labels_sa[2],
+          (topic == 3)~topic_labels_sa[3],
+          (topic == 4)~topic_labels_sa[4],
+          (topic == 5)~topic_labels_sa[5],
+          (topic == 6)~topic_labels_sa[6],
+          (topic == 7)~topic_labels_sa[7],
+          (topic == 8)~topic_labels_sa[8],
+          (topic == 9)~topic_labels_sa[9],
+          (topic == 10)~topic_labels_sa[10]
+          ))
+# plot
+fit_terms_sa %>%
+mutate(term = reorder_within(term, beta, topic)) %>%
+ggplot(aes(beta, term, fill = factor(topic))) +
+geom_col(show.legend = FALSE) +
+facet_wrap(~ labels, scales = "free") +
+scale_y_reordered() + theme(plot.title = element_text(hjust = 0.05)) + ggtitle("Topic Labelling with frequency of  word counts in each topic for satisfied customers") #satisfied group
+
+#topic labeling
+topic_labels_unsa <- c("cooking","domestic_appliances","coffee_machine","knives","beddings","toasters","cost_effective","bathings","warranty","pans","food_containers","hand_wash","storages","hard_jobs")
+fit_terms_unsa <- fit_terms_unsa %>% 
+  mutate (labels = case_when((topic == 1)~topic_labels_unsa[1],
+          (topic == 2)~topic_labels_unsa[2],
+          (topic == 3)~topic_labels_unsa[3],
+          (topic == 4)~topic_labels_unsa[4],
+          (topic == 5)~topic_labels_unsa[5],
+          (topic == 6)~topic_labels_unsa[6],
+          (topic == 7)~topic_labels_unsa[7],
+          (topic == 8)~topic_labels_unsa[8],
+          (topic == 9)~topic_labels_unsa[9],
+          (topic == 10)~topic_labels_unsa[10],
+          (topic == 11)~topic_labels_unsa[11],
+          (topic == 12)~topic_labels_unsa[12],
+          (topic == 13)~topic_labels_unsa[13],
+          (topic == 14)~topic_labels_unsa[14]
+          ))
+
+# plot
+fit_terms_unsa %>%
+mutate(term = reorder_within(term, beta, topic)) %>%
+ggplot(aes(beta, term, fill = factor(topic))) +
+geom_col(show.legend = FALSE) +
+facet_wrap(~ labels, scales = "free") +
+scale_y_reordered() + theme(plot.title = element_text(hjust = 0.05)) + ggtitle("Topic Labelling with frequency of  word counts in each topic for unsatisfied customers")
+
+```
+
+```{r}
+#wordcloud
+#satisfied group
+
+stm::cloud(fits_sa,topic = 1,max.word = 80)
+stm::cloud(fits_sa,topic = 2,max.word = 80)
+stm::cloud(fits_sa,topic = 3,max.word = 80)
+stm::cloud(fits_sa,topic = 4,max.word = 80)
+stm::cloud(fits_sa,topic = 5,max.word = 80)
+stm::cloud(fits_sa,topic = 6,max.word = 80)
+stm::cloud(fits_sa,topic = 7,max.word = 80)
+stm::cloud(fits_sa,topic = 8,max.word = 80)
+stm::cloud(fits_sa,topic = 9,max.word = 80)
+stm::cloud(fits_sa,topic = 10,max.word = 80)
+
+#unsatisfied group
+stm::cloud(fits_unsa,topic = 1,max.word = 80)
+stm::cloud(fits_unsa,topic = 2,max.word = 80)
+stm::cloud(fits_unsa,topic = 3,max.word = 80)
+stm::cloud(fits_unsa,topic = 4,max.word = 80)
+stm::cloud(fits_unsa,topic = 5,max.word = 80)
+stm::cloud(fits_unsa,topic = 6,max.word = 80)
+stm::cloud(fits_unsa,topic = 7,max.word = 80)
+stm::cloud(fits_unsa,topic = 8,max.word = 80)
+stm::cloud(fits_unsa,topic = 9,max.word = 80)
+stm::cloud(fits_unsa,topic = 10,max.word = 80)
+stm::cloud(fits_unsa,topic = 11,max.word = 80)
+stm::cloud(fits_unsa,topic = 12,max.word = 80)
+stm::cloud(fits_unsa,topic = 13,max.word = 80)
+stm::cloud(fits_unsa,topic = 14,max.word = 80)
+
+
+```
+
+```{r}
+gamma_topics_sa <- tidy(fits_sa,matrix="gamma")
+
+gamma_topics_sa <- gamma_topics_sa %>%
+pivot_wider(names_from = topic, values_from = gamma)
+
+colnames(gamma_topics_sa) <- c("document",topic_labels_sa)
+
+gamma_topics_sa <- as.data.frame(gamma_topics_sa)
+rownames(gamma_topics_sa) <- gamma_topics_sa$document
+gamma_topics_sa$document <- NULL
+
+
+corrplot::corrplot(cor(gamma_topics_sa))
+
+pca_uniquness_sa <- FactoMineR::PCA(gamma_topics_sa,graph = FALSE)
+factoextra::fviz_pca_var(pca_uniquness_sa)
+
+
+
+gamma_topics_unsa <- tidy(fits_unsa,matrix="gamma")
+
+gamma_topics_unsa <- gamma_topics_unsa %>%
+pivot_wider(names_from = topic, values_from = gamma)
+
+colnames(gamma_topics_unsa) <- c("document",topic_labels_unsa)
+
+gamma_topics_unsa <- as.data.frame(gamma_topics_unsa)
+rownames(gamma_topics_unsa) <- gamma_topics_unsa$document
+gamma_topics_unsa$document <- NULL
+
+
+corrplot::corrplot(cor(gamma_topics_unsa))
+
+pca_uniquness_unsa <- FactoMineR::PCA(gamma_topics_unsa,graph = FALSE)
+factoextra::fviz_pca_var(pca_uniquness_unsa)
+
+ 
+```
+
+```{r}
+# estimate the effect of ratings on topics
+effects_sa <- estimateEffect(~overall,
+stmobj = fits_sa,
+metadata = out_sa$meta) #satisfied group
+saveRDS(effects_sa,"effects_sa")
+
+plot(effects_sa, covariate = "overall",
+     topics = c(1,2,3,4,5,6,7,8,9,10),
+     model = fits_sa, method = "difference",
+     cov.value1 = "100", cov.value2 = "0",
+     xlab = "Low Rating ... High Rating",
+     xlim = c(-0.05,0.05),
+     main = "",
+     ci.level = 0.05,
+     custom.labels =topic_labels_sa,
+     labeltype = "custom") 
+# plotting each topic separately
+for(i in 1:length(topic_labels_sa)){
+plot(effects_sa, covariate = "overall",
+     topics = i,
+     model = fits_sa, method = "continuous",
+     # For this plotting we get the uper quantile
+     # and low quantile of the price
+     xlab = "rating",
+     main = topic_labels_sa[i],
+     printlegend = FALSE,
+     custom.labels =topic_labels_sa[i],
+     labeltype = "custom")
+}
+
+effects_unsa <- estimateEffect(~overall,
+stmobj = fits_unsa,
+metadata = out_unsa$meta)
+saveRDS(effects_unsa,"effects_unsa")
+
+
+plot(effects_unsa, covariate = "overall",
+     topics = c(1,2,3,4,5,6,7,8,9,10,11,12,13,14),
+     model = fits_unsa, method = "difference",
+     cov.value1 = "100", cov.value2 = "0",
+     xlab = "Low Rating ... High Rating",
+     xlim = c(-0.05,0.05),
+     main = "",
+     ci.level = 0.05,
+     custom.labels =topic_labels_unsa,
+     labeltype = "custom")
+# plotting each topic separately
+for(i in 1:length(topic_labels_unsa)){
+plot(effects_unsa, covariate = "overall",
+     topics = i,
+     model = fits_unsa, method = "continuous",
+     # For this plotting we get the uper quantile
+     # and low quantile of the price
+     xlab = "rating",
+     main = topic_labels_unsa[i],
+     printlegend = FALSE,
+     custom.labels =topic_labels_unsa[i],
+     labeltype = "custom")
+}
+```
+
+```{r}
+# join the sentiment scores with the previous data
+sentimentscore <- read_csv("Sample_Sentiment_Df.csv")
+#sentimentscore <- sentimentscore %>%
+  #select(line,bing_sentiment,loughran_sentiment,nrc_sentiment,afinn_sentiment,custype)
+
+sentimentscore_sa <- sentimentscore %>%
+  filter (custype == "satisfied")
+sentimentscore_unsa <- sentimentscore %>%
+  filter (custype == "dissatisfied")
+
+satisfied_sent <- satisfied %>% left_join(sentimentscore_sa, by = c("review_id" ="line")) %>% na.omit()
+unsatisfied_sent <- unsatisfied %>% left_join(sentimentscore_unsa, by = c("review_id" ="line")) %>% na.omit()
+
+
+```
+
+```{r}
+this_stm_object <- fits_sa$theta
+# remember that we just rename the column names for the 
+# topics so we have a better naming convention than just 
+# '1' or '2' etc.
+colnames(this_stm_object) <- paste0(topic_labels_sa)
+
+sa_topic_df <- cbind(out_sa$meta,this_stm_object)
+str(sa_topic_df)
+# create topic summaries 
+
+sa_topic_df <- sa_topic_df %>% 
+  group_by(overall,review_id) %>% 
+  summarise(pans=mean(pans),
+            costeffective = mean(cost_effective),
+            knives = mean(knives),
+            kitchenstorage = mean(kitchen_storage),
+            Glassjars = mean(Glass_jars),
+            coffeemachine = mean(coffee_machine),
+            domesticappliances = mean(domestic_appliances),
+            beddings = mean(beddings),
+            shelfspace = mean(shelf_space),
+            cooking = mean(cooking)) 
+
+# join the sentiment score
+sa_topic_df <- sa_topic_df %>% left_join(sentimentscore_sa, by = c("review_id" = "line")) %>%
+  na.omit()
+
+sa_topic_df$overall <- factor(sa_topic_df$overall, order = TRUE, levels = c(4,5))
+
+# regression
+library(ordinal)
+model0_occ <- clm(overall~bing_sentiment,data=sa_topic_df)
+model1_occ <- clm(overall~pans+bing_sentiment,data=sa_topic_df)
+model2_occ <- clm(overall~costeffective+bing_sentiment,data=sa_topic_df)
+model3_occ <- clm(overall~knives+bing_sentiment,data=sa_topic_df)
+model4_occ <- clm(overall~kitchenstorage+bing_sentiment,data=sa_topic_df)
+model5_occ <- clm(overall~Glassjars+bing_sentiment,data=sa_topic_df)
+model6_occ <- clm(overall~coffeemachine+bing_sentiment,data=sa_topic_df)
+model7_occ <- clm(overall~domesticappliances+bing_sentiment,data=sa_topic_df)
+model8_occ <- clm(overall~beddings+bing_sentiment,data=sa_topic_df)
+model9_occ <- clm(overall~shelfspace+bing_sentiment,data=sa_topic_df)
+model10_occ <- clm(overall~cooking+bing_sentiment,data=sa_topic_df)
+library(stargazer)
+stargazer::stargazer(model1_occ,model2_occ,
+                     model3_occ,model4_occ,
+                     model5_occ,model6_occ,
+                     model7_occ,model8_occ,
+                     model9_occ,model10_occ,
+                     type = "text")
+# goodness of fit
+anova(model0_occ, model1_occ, test ="Chisq")
+library(pscl)
+pR2(model0_occ) 
+pR2(model1_occ) 
+
+anova(model0_occ, model2_occ, test ="Chisq")
+library(pscl)
+pR2(model2_occ) 
+
+anova(model0_occ, model3_occ, test ="Chisq")
+library(pscl)
+pR2(model3_occ) 
+
+anova(model0_occ, model4_occ, test ="Chisq")
+library(pscl)
+pR2(model4_occ) 
+
+anova(model0_occ, model5_occ, test ="Chisq")
+library(pscl)
+pR2(model5_occ) 
+
+anova(model0_occ, model6_occ, test ="Chisq")
+library(pscl)
+pR2(model6_occ) 
+
+anova(model0_occ, model7_occ, test ="Chisq")
+library(pscl)
+pR2(model7_occ) 
+
+anova(model0_occ, model8_occ, test ="Chisq")
+library(pscl)
+pR2(model8_occ) 
+
+anova(model0_occ, model9_occ, test ="Chisq")
+library(pscl)
+pR2(model9_occ) 
+
+anova(model0_occ, model10_occ, test ="Chisq")
+library(pscl)
+pR2(model10_occ) 
+
+
+
+```
+
+```{r}
+unsa_stm_object <- fits_unsa$theta
+# remember that we just rename the column names for the topics
+colnames(unsa_stm_object) <- paste0(topic_labels_unsa)
+
+unsa_topic_df <- cbind(out_unsa$meta,unsa_stm_object)
+# create topic summaries 
+unsa_topic_df <- unsa_topic_df %>% 
+  group_by(overall,review_id) %>% 
+  summarise(cooking = mean(cooking),
+            domestic_appliances = mean(domestic_appliances),
+            coffee_machine = mean(coffee_machine),
+            knives = mean(knives),
+            beddings = mean(beddings),
+            toasters = mean(toasters),
+            cost_effective = mean(cost_effective),
+            bathings = mean(bathings),
+            warranty = mean(warranty),
+            pans = mean(pans),
+            food_containers = mean(food_containers),
+            hand_wash = mean(hand_wash),
+            storages = mean(storages),
+            hard_jobs = mean(hard_jobs))
+
+
+# join the sentiment score
+unsa_topic_df <- unsa_topic_df %>% left_join(sentimentscore_unsa, by = c("review_id" = "line")) %>%
+  na.omit()
+
+unsa_topic_df$overall <- factor(unsa_topic_df$overall, order = TRUE, levels = c(1,2,3))
+
+# regression
+library(ordinal)
+un_model0_occ <- polr(overall~bing_sentiment,data=unsa_topic_df)
+un_model1_occ <- polr(overall~cooking+bing_sentiment,data=unsa_topic_df)
+un_model2_occ <- polr(overall~domestic_appliances+bing_sentiment,data=unsa_topic_df)
+un_model3_occ <- polr(overall~coffee_machine+bing_sentiment,data=unsa_topic_df)
+un_model4_occ <- polr(overall~knives+bing_sentiment,data=unsa_topic_df)
+un_model5_occ <- polr(overall~beddings+bing_sentiment,data=unsa_topic_df)
+un_model6_occ <- polr(overall~toasters+bing_sentiment,data=unsa_topic_df)
+un_model7_occ <- polr(overall~cost_effective+bing_sentiment,data=unsa_topic_df)
+un_model8_occ <- polr(overall~bathings+bing_sentiment,data=unsa_topic_df)
+un_model9_occ <- polr(overall~warranty+bing_sentiment,data=unsa_topic_df)
+un_model10_occ <- polr(overall~pans+bing_sentiment,data=unsa_topic_df)
+un_model11_occ <- polr(overall~food_containers+bing_sentiment,data=unsa_topic_df)
+un_model12_occ <- polr(overall~hand_wash+bing_sentiment,data=unsa_topic_df)
+un_model13_occ <- polr(overall~storages+bing_sentiment,data=unsa_topic_df)
+un_model14_occ <- polr(overall~hard_jobs+bing_sentiment,data=unsa_topic_df)
+
+
+
+library(stargazer)
+stargazer::stargazer(un_model1_occ,un_model2_occ,
+                     un_model3_occ,un_model4_occ,
+                     un_model5_occ,un_model6_occ,
+                     un_model7_occ,un_model8_occ,
+                     un_model9_occ,un_model10_occ,
+                     un_model11_occ,un_model12_occ,
+                     un_model13_occ,un_model14_occ,
+                     type = "text")
+# goodness of fit
+anova(un_model0_occ, un_model1_occ, test ="Chisq")
+library(pscl)
+pR2(un_model0_occ) 
+pR2(un_model1_occ) 
+
+anova(un_model0_occ, un_model2_occ, test ="Chisq")
+library(pscl)
+pR2(un_model2_occ) 
+
+anova(un_model0_occ, un_model3_occ, test ="Chisq")
+library(pscl)
+pR2(un_model3_occ) 
+
+anova(un_model0_occ, un_model4_occ, test ="Chisq")
+library(pscl)
+pR2(un_model4_occ) 
+
+anova(un_model0_occ, un_model5_occ, test ="Chisq")
+library(pscl)
+pR2(un_model5_occ) 
+
+anova(un_model0_occ, un_model6_occ, test ="Chisq")
+library(pscl)
+pR2(model6_occ) 
+
+anova(un_model0_occ, un_model7_occ, test ="Chisq")
+library(pscl)
+pR2(un_model7_occ) 
+
+anova(un_model0_occ, un_model8_occ, test ="Chisq")
+library(pscl)
+pR2(un_model8_occ) 
+
+anova(un_model0_occ, un_model9_occ, test ="Chisq")
+library(pscl)
+pR2(un_model9_occ) 
+
+anova(un_model0_occ, un_model10_occ, test ="Chisq")
+library(pscl)
+pR2(un_model10_occ) 
+
+anova(un_model0_occ, un_model11_occ, test ="Chisq")
+library(pscl)
+pR2(un_model11_occ) 
+
+anova(un_model0_occ, un_model12_occ, test ="Chisq")
+library(pscl)
+pR2(un_model12_occ) 
+
+anova(un_model0_occ, un_model13_occ, test ="Chisq")
+library(pscl)
+pR2(un_model13_occ) 
+
+anova(un_model0_occ, un_model14_occ, test ="Chisq")
+library(pscl)
+pR2(un_model14_occ) 
+
+```
+
