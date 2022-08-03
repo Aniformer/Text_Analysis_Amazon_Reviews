@@ -1,12 +1,4 @@
-# Clustering_TextData_With_Document_Vectorization
-Conducted clustering analysis on textual data using Kmeans, an unsupervised machine learning algorithm. Preprocessed data and vectorized the textual data since Kmeans calculates the Euclidean distance between fields of each of record and Euclidean distance cannot be calculated for text. 
+# Text_Analysis_Amazon_Reviews
+Downloaded the review data and corresponding metadata from [this link](https://jmcauley.ucsd.edu/data/amazon/). Implemented bag of words model to extract dominant words, common word associations and text features (such as readability, length, etc of review,) that relate to review score. 
 
-Vectorized text by calculating tf-idf (term frequences-inverse document frequencies) values, creating a document term matrix. Filtered out terms that are too frequent or too rare, focusing on terms that add meaning to the data. 
-
-Reduced the dimensionality of the document term matrix through PCA, to visualize the cluster solution across the principal components. 
-
-Requirements: 
-Python
-
-
-
+Conducted sentiment analysis and analyzed the effect of sentiment on review score and performed unsupervised latent dirichlet allocation to look at topics generated across the corpus. 
